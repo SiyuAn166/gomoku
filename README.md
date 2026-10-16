@@ -4,11 +4,15 @@ A Gomoku (five-in-a-row) web game for two phones on the same WiFi. Deploys to Gi
 
 ## How to play
 
-- **Create room** → you play Black (first move); first come, first seated
-- **First to join** the room plays White (second move)
+- **Create room** → you play Black in game 1 (first move); first come, first seated
+- **First to join** the room takes the other seat
 - **Everyone joining after that** becomes a spectator with a live board
+- **Colors swap after every finished game** — nobody stays Black forever (standard match play)
+- Scoreboard shows the round number and each player's win count: `Game 3 · Alex 2 : 1 Sam`
 - 4-character room code; tap it to copy and share
-- Resign, rematch (needs opponent confirmation), last-move marker, winning-line highlight
+- Mid-game: **Undo** (take back a move), **Draw** (offer a draw), **Resign** — undo and draw need the opponent's confirmation
+- After a game: **Rematch** (needs the other player's confirmation)
+- Last-move marker, winning-line highlight, live turn indicator
 
 ## Try it locally (two phones)
 

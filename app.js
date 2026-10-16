@@ -3,20 +3,26 @@
  * Depends on: logic.js (pure game logic), PeerJS CDN (window.Peer)
  *
  * Networking model:
- * - Whoever creates the room = host = Black (first move), and is authoritative:
+ * - Whoever creates the room = host = Black in round 1, and is authoritative:
  *   validates every move, owns the full state, broadcasts it to everyone.
- * - The first to join the room = White (second move); sends move requests to host.
- * - Everyone joining after that = spectator; receives state only, cannot move.
+ * - The first to join the room takes the other seat; everyone after spectates.
+ * - Colors alternate after every finished game (standard match play):
+ *   seat holders swap, round++.
  * - Room code is 4 chars; Peer ID is 'gomoku-' + room code.
  *
- * Seat robustness (fixed 2026-10-16):
- * - Host tracks each DataConnection by a unique connection id, not by peer id,
- *   so a duplicate/stale connection can never silently steal or block a seat.
+ * Seat model: state.players.black/white = { name, holder } | null
+ *   holder is 'host' or a host-side connection id.
+ *
+ * Seat robustness:
+ * - Host tracks each DataConnection by a unique connection id, not by peer id.
  * - A new connection from an already-seen peer replaces the old one (reconnect).
  * - Heartbeat both directions: connections silent for >20s are treated as dead
  *   and their seats are freed.
- * - When the White seat frees up, the earliest spectator is auto-promoted,
- *   keeping "first come, first seated".
+ * - When a seat frees up, the earliest spectator is auto-promoted
+ *   ("first come, first seated").
+ *
+ * In-game requests (need the other seat's confirmation):
+ *   state.request = { type: 'rematch'|'undo'|'draw', by: 'black'|'white' } | null
  */
 
 var $ = function (id) { return document.getElementById(id); };
@@ -31,10 +37,8 @@ var peer = null;
 var hostConn = null;      // guest side: connection to the host
 var conns = new Map();    // host side: connId -> { conn, name, role, lastPong, replaced }
 var peerToConn = {};      // host side: peerId -> connId (one live connection per peer)
-var whiteConnId = null;   // connId currently holding the White seat
-var whitePeerId = null;   // peerId currently holding the White seat
 var state = null;         // local copy of state (authoritative on host side)
-var rematchSeen = '';     // marker of the rematch dialog already shown
+var reqSeen = '';         // marker of the request dialog already shown
 var connecting = false;
 var hbTimer = null;       // host heartbeat interval
 var hostHbTimer = null;   // guest watchdog interval
@@ -69,10 +73,14 @@ function snapshot(s) { return JSON.parse(JSON.stringify(s)); }
 function mySide() {
   return myRole === 'black' ? 'black' : myRole === 'white' ? 'white' : 'spectator';
 }
-function nameOf(side) {
+function otherSeat(s) { return s === 'black' ? 'white' : 'black'; }
+function nameOf(seat) {
   if (!state || !state.players) return '';
-  var p = state.players[side];
+  var p = state.players[seat];
   return p ? p.name : '';
+}
+function reqName(type) {
+  return type === 'rematch' ? 'a rematch' : type === 'undo' ? 'to undo a move' : 'a draw';
 }
 function makeCode() {
   var abc = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no ambiguous chars
@@ -83,6 +91,42 @@ function makeCode() {
 function connIdOf(conn) {
   if (!conn._cid) conn._cid = conn.connectionId || ('c' + (++cidSeq) + '_' + conn.peer);
   return conn._cid;
+}
+/* Which seat does the host currently hold? The host always holds exactly one. */
+function hostSeat() {
+  if (state && state.players.black && state.players.black.holder === 'host') return 'black';
+  if (state && state.players.white && state.players.white.holder === 'host') return 'white';
+  return 'black';
+}
+/* Is a seat currently held by someone live? */
+function seatLive(seat) {
+  var p = state.players[seat];
+  if (!p) return false;
+  return p.holder === 'host' || conns.has(p.holder);
+}
+function freeSeat() {
+  if (!seatLive('black')) return 'black';
+  if (!seatLive('white')) return 'white';
+  return null;
+}
+function uniqueName(name, selfConnId) {
+  var taken = {};
+  ['black', 'white'].forEach(function (s) {
+    var p = state.players[s];
+    if (p && seatLive(s) && p.holder !== selfConnId) taken[p.name] = true;
+  });
+  (state.spectators || []).forEach(function (sp) {
+    if (sp.id !== selfConnId) taken[sp.name] = true;
+  });
+  if (!taken[name]) return name;
+  var i = 2;
+  while (taken[name + ' ' + i]) i++;
+  return name + ' ' + i;
+}
+function creditWin(seat) {
+  var n = nameOf(seat);
+  if (!n) return;
+  state.score[n] = (state.score[n] || 0) + 1;
 }
 
 /* ---------------- Screens ---------------- */
@@ -134,8 +178,6 @@ function resetNetState() {
   hostConn = null;
   conns.clear();
   peerToConn = {};
-  whiteConnId = null;
-  whitePeerId = null;
   stopHeartbeat();
   stopHostWatchdog();
 }
@@ -144,9 +186,10 @@ function openHostPeer() {
   peer = new Peer('gomoku-' + roomCode);
   peer.on('open', function () {
     connecting = false;
+    state = newWaitingState(myName);
+    state.players.black.holder = 'host';
     myRole = 'black';
     myColor = BLACK;
-    state = newWaitingState(myName);
     setNetDot(true);
     enterRoom();
     startHeartbeat();
@@ -160,7 +203,6 @@ function openHostPeer() {
   });
   peer.on('error', function (err) {
     if (err && err.type === 'unavailable-id') {
-      // Extremely rare code collision: retry with a new code
       roomCode = makeCode();
       try { peer.destroy(); } catch (e) {}
       openHostPeer();
@@ -175,8 +217,6 @@ function openHostPeer() {
 function onGuestConnected(conn) {
   var id = connIdOf(conn);
   conn.on('open', function () {
-    // A new connection from an already-seen peer replaces the old one
-    // (handles re-join / duplicate connections without ghost seats).
     var oldId = peerToConn[conn.peer];
     if (oldId && oldId !== id) {
       var oldRec = conns.get(oldId);
@@ -207,32 +247,32 @@ function broadcastState() {
 }
 
 function handleGuestMessage(conn, msg) {
-  var rec = conns.get(connIdOf(conn));
+  var id = connIdOf(conn);
+  var rec = conns.get(id);
   if (!rec || rec.replaced) return;
 
   if (msg.t === 'ping') { sendTo(rec, { t: 'pong' }); return; }
   if (msg.t === 'pong') { rec.lastPong = Date.now(); return; }
 
   if (msg.t === 'hello') {
-    if (rec.role) { // duplicate hello: resend welcome packet
+    if (rec.role) {
       sendTo(rec, { t: 'welcome', role: rec.role, state: state });
       return;
     }
-    var name = clampName(msg.name) || 'Player';
+    var name = uniqueName(clampName(msg.name) || 'Player', id);
     rec.name = name;
-    // The White seat is free if nobody holds it, if the holder's connection
-    // is gone, or if this is the same peer reconnecting.
-    var whiteAlive = !!(whiteConnId && conns.has(whiteConnId) && state.players.white);
-    if (!whiteAlive || whitePeerId === conn.peer) {
-      rec.role = 'white';
-      state.players.white = { name: name };
-      whiteConnId = connIdOf(conn);
-      whitePeerId = conn.peer;
-      if (state.status === 'waiting') { state.status = 'playing'; state.notice = ''; }
-      toast(name + ' took the White seat');
+    var seat = freeSeat();
+    if (seat) {
+      rec.role = seat;
+      state.players[seat] = { name: name, holder: id };
+      if (state.status === 'waiting' && state.players.black && state.players.white) {
+        state.status = 'playing';
+        state.notice = '';
+      }
+      toast(name + ' took the ' + (seat === 'black' ? 'Black' : 'White') + ' seat');
     } else {
       rec.role = 'spectator';
-      state.spectators.push({ id: connIdOf(conn), name: name });
+      state.spectators.push({ id: id, name: name });
       toast(name + ' joined as spectator');
     }
     sendTo(rec, { t: 'welcome', role: rec.role, state: state });
@@ -241,50 +281,120 @@ function handleGuestMessage(conn, msg) {
   }
 
   if (msg.t === 'move') {
-    if (rec.role !== 'white') { sendTo(rec, { t: 'error', msg: 'Spectators cannot place stones' }); return; }
+    var turnSeat = state.turn === BLACK ? 'black' : 'white';
+    if (rec.role !== turnSeat) {
+      sendTo(rec, { t: 'error', msg: rec.role ? 'Not your turn' : 'Spectators cannot place stones' });
+      return;
+    }
+    var color = state.turn;
     state.notice = '';
-    var r = applyMove(state, msg.x | 0, msg.y | 0, WHITE);
+    var r = applyMove(state, msg.x | 0, msg.y | 0, color);
     if (!r.ok) { sendTo(rec, { t: 'error', msg: r.error }); return; }
+    state.history.push({ x: msg.x | 0, y: msg.y | 0, color: color });
+    if (r.winLine) creditWin(turnSeat);
     vibrate();
     broadcastState();
     return;
   }
 
   if (msg.t === 'resign') {
-    if (rec.role !== 'white' || state.status !== 'playing') return;
-    state.status = 'over';
-    state.winner = BLACK;
-    state.turn = 0;
-    state.rematchBy = null;
-    state.notice = rec.name + ' resigned';
-    toast(state.notice);
+    if ((rec.role !== 'black' && rec.role !== 'white') || state.status !== 'playing') return;
+    endByResign(rec.role);
+    return;
+  }
+
+  if (msg.t === 'request') {
+    if (!validRequest(rec.role, msg.type)) return;
+    state.request = { type: msg.type, by: rec.role };
     broadcastState();
     return;
   }
 
-  if (msg.t === 'rematch') {
-    if (rec.role !== 'white' || state.status !== 'over') return;
-    state.rematchBy = 'white';
-    state.notice = '';
-    broadcastState(); // host UI will pop the confirm dialog
+  if (msg.t === 'request-accept') {
+    var rq = state.request;
+    if (!rq) return;
+    if (rec.role !== otherSeat(rq.by)) return; // only the other seat can accept
+    applyRequest();
     return;
   }
 
-  if (msg.t === 'rematch-accept') {
-    if (rec.role !== 'white' || state.rematchBy !== 'white') return;
+  if (msg.t === 'request-decline') {
+    var rq2 = state.request;
+    if (!rq2) return;
+    if (rec.role !== otherSeat(rq2.by)) return;
+    state.request = null;
+    state.notice = nameOf(rec.role) + ' declined ' + reqName(rq2.type);
+    broadcastState();
+    return;
+  }
+}
+
+function validRequest(seat, type) {
+  if (state.request) return false;
+  if (seat !== 'black' && seat !== 'white') return false;
+  if (type === 'rematch') return state.status === 'over';
+  if (type === 'draw') return state.status === 'playing';
+  if (type === 'undo') return state.status === 'playing' && state.history.length > 0;
+  return false;
+}
+
+/* Apply an accepted request (host side). */
+function applyRequest() {
+  var rq = state.request;
+  if (!rq) return;
+  if (rq.type === 'rematch') {
+    var b = state.players.black, w = state.players.white;
+    if (b && w) {
+      // Standard match play: swap colors, next round.
+      state.players.black = w;
+      state.players.white = b;
+      state.round++;
+      state.notice = 'Round ' + state.round + ' — colors swapped';
+    } else {
+      state.notice = '';
+    }
+    state.request = null;
     resetBoard(state);
-    toast('Rematch!');
-    broadcastState();
-    return;
+    if (!state.players.black || !state.players.white) state.status = 'waiting';
+    syncRoles();
+  } else if (rq.type === 'undo') {
+    var last = state.history.pop();
+    if (last) {
+      state.board[last.y][last.x] = EMPTY;
+      state.moveCount--;
+      state.turn = last.color;
+      var prev = state.history[state.history.length - 1];
+      state.lastMove = prev ? { x: prev.x, y: prev.y, color: prev.color } : null;
+    }
+    state.request = null;
+    state.notice = '';
+  } else if (rq.type === 'draw') {
+    state.status = 'over';
+    state.winner = 0;
+    state.turn = 0;
+    state.request = null;
+    state.notice = '';
   }
+  broadcastState();
+}
 
-  if (msg.t === 'rematch-decline') {
-    if (rec.role !== 'white' || state.rematchBy !== 'white') return;
-    state.rematchBy = null;
-    state.notice = rec.name + ' declined the rematch';
-    broadcastState();
-    return;
-  }
+/* After seats change hands: refresh host role + tell seated guests their role. */
+function syncRoles() {
+  myRole = hostSeat();
+  myColor = myRole === 'black' ? BLACK : WHITE;
+  var badge = $('role-badge');
+  badge.textContent = myRole === 'black' ? 'Black · First' : 'White · Second';
+  badge.className = 'role-badge ' + myRole;
+  ['black', 'white'].forEach(function (seat) {
+    var p = state.players[seat];
+    if (p && p.holder && p.holder !== 'host') {
+      var rec = conns.get(p.holder);
+      if (rec) {
+        rec.role = seat;
+        sendTo(rec, { t: 'welcome', role: seat, state: state });
+      }
+    }
+  });
 }
 
 function onGuestLeft(conn) {
@@ -294,14 +404,12 @@ function onGuestLeft(conn) {
   conns.delete(id);
   if (peerToConn[conn.peer] === id) delete peerToConn[conn.peer];
   if (rec.replaced) return; // superseded by a newer connection; the seat stays
-  if (rec.role === 'white') {
-    var name = rec.name || 'White';
-    state.players.white = null;
-    whiteConnId = null;
-    whitePeerId = null;
-    state.rematchBy = null;
+  var seat = (rec.role === 'black' || rec.role === 'white') ? rec.role : null;
+  if (seat && state.players[seat] && state.players[seat].holder === id) {
+    var name = state.players[seat].name;
+    state.players[seat] = null;
+    state.request = null;
     if (state.status === 'playing') {
-      // White left mid-game: clear the board and wait for a new challenger
       state.board = createBoard();
       state.turn = BLACK;
       state.status = 'waiting';
@@ -309,10 +417,11 @@ function onGuestLeft(conn) {
       state.winLine = null;
       state.lastMove = null;
       state.moveCount = 0;
+      state.history = [];
     }
     state.notice = name + ' left the room';
     toast(name + ' left the room');
-    promoteSpectator();
+    promoteSpectator(seat);
     if (state.status === 'waiting' && state.players.black && state.players.white) {
       state.status = 'playing';
       state.notice = '';
@@ -324,19 +433,17 @@ function onGuestLeft(conn) {
   broadcastState();
 }
 
-/* First spectator in line takes the freed White seat ("first come, first seated"). */
-function promoteSpectator() {
+/* First spectator in line takes the freed seat ("first come, first seated"). */
+function promoteSpectator(seat) {
   var sp = state.spectators;
   if (!sp.length) return;
   var next = sp.shift();
   var rec = conns.get(next.id);
-  if (!rec || rec.replaced) { promoteSpectator(); return; }
-  rec.role = 'white';
-  state.players.white = { name: rec.name };
-  whiteConnId = next.id;
-  whitePeerId = rec.conn.peer;
-  sendTo(rec, { t: 'welcome', role: 'white', state: state });
-  toast(rec.name + ' took the White seat');
+  if (!rec || rec.replaced) { promoteSpectator(seat); return; }
+  rec.role = seat;
+  state.players[seat] = { name: rec.name, holder: next.id };
+  sendTo(rec, { t: 'welcome', role: seat, state: state });
+  toast(rec.name + ' took the ' + (seat === 'black' ? 'Black' : 'White') + ' seat');
 }
 
 /* Host heartbeat: reap connections silent for >20s (ghost peers). */
@@ -349,7 +456,7 @@ function startHeartbeat() {
       if (rec.replaced) { conns.delete(id); return; }
       if (now - rec.lastPong > 20000) {
         try { rec.conn.close(); } catch (e) {}
-        onGuestLeft(rec.conn); // ensure cleanup even if the close event is lost
+        onGuestLeft(rec.conn);
       } else {
         try { rec.conn.send({ t: 'ping' }); } catch (e) {}
       }
@@ -360,41 +467,65 @@ function stopHeartbeat() {
   if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
 }
 
-/* Host (Black) own actions */
+/* Host (local player) actions */
 function hostMove(x, y) {
+  var turnSeat = state.turn === BLACK ? 'black' : 'white';
+  if (hostSeat() !== turnSeat) { toast('Not your turn'); return; }
+  var color = state.turn;
   state.notice = '';
-  var r = applyMove(state, x, y, BLACK);
+  var r = applyMove(state, x, y, color);
   if (!r.ok) { toast(r.error); return; }
+  state.history.push({ x: x, y: y, color: color });
+  if (r.winLine) creditWin(turnSeat);
   vibrate();
   broadcastState();
 }
-function hostResign() {
+function endByResign(seat) {
   if (state.status !== 'playing') return;
+  var winnerSeat = otherSeat(seat);
   state.status = 'over';
-  state.winner = WHITE;
+  state.winner = winnerSeat === 'black' ? BLACK : WHITE;
   state.turn = 0;
-  state.rematchBy = null;
-  state.notice = 'You resigned';
+  state.request = null;
+  state.notice = nameOf(seat) + ' resigned';
+  creditWin(winnerSeat);
   broadcastState();
 }
-function hostRequestRematch() {
-  if (state.status !== 'over') return;
-  state.rematchBy = 'black';
-  state.notice = '';
-  broadcastState();
+function sendRequest(type) {
+  if (mode === 'host') {
+    if (!validRequest(hostSeat(), type)) return;
+    state.request = { type: type, by: hostSeat() };
+    broadcastState();
+  } else if (hostConn) {
+    hostConn.send({ t: 'request', type: type });
+  }
 }
-function hostAcceptRematch() {
-  resetBoard(state);
-  toast('Rematch!');
-  broadcastState();
+function acceptRequest() {
+  hideModal();
+  if (mode === 'host') applyRequest();
+  else if (hostConn) hostConn.send({ t: 'request-accept' });
 }
-function hostDeclineRematch() {
-  state.rematchBy = null;
-  state.notice = 'You declined the rematch';
-  broadcastState();
+function declineRequest() {
+  hideModal();
+  if (mode === 'host') {
+    var rq = state.request;
+    if (!rq) return;
+    state.request = null;
+    state.notice = nameOf(hostSeat()) + ' declined ' + reqName(rq.type);
+    broadcastState();
+  } else if (hostConn) {
+    hostConn.send({ t: 'request-decline' });
+  }
+}
+function onResign() {
+  showConfirm('Resign the game?', function () {
+    hideModal();
+    if (mode === 'host') endByResign(hostSeat());
+    else if (hostConn) hostConn.send({ t: 'resign' });
+  }, hideModal);
 }
 
-/* ---------------- Guest (White / spectator) ---------------- */
+/* ---------------- Guest (seated player / spectator) ---------------- */
 function joinRoom(code) {
   if (typeof Peer === 'undefined') { toast('Failed to load network module. Check your connection and refresh.'); return; }
   resetNetState();
@@ -474,7 +605,11 @@ function onHostMessage(msg) {
     myColor = msg.role === 'black' ? BLACK : msg.role === 'white' ? WHITE : 0;
     state = msg.state;
     enterRoom();
-    toast(msg.role === 'white' ? 'Seated! You are White (second move)' : 'You are now spectating');
+    toast(
+      msg.role === 'black' ? 'You are now Black (first move)' :
+      msg.role === 'white' ? 'Seated! You are White (second move)' :
+      'You are now spectating'
+    );
     return;
   }
   if (msg.t === 'state') {
@@ -502,7 +637,7 @@ function errTypeText(err) {
 
 /* ---------------- Shared: enter / leave ---------------- */
 function enterRoom() {
-  rematchSeen = '';
+  reqSeen = '';
   hideModal();
   $('room-code').textContent = roomCode;
   var badge = $('role-badge');
@@ -519,7 +654,7 @@ function cleanupToHome() {
   stopHostWatchdog();
   resetNetState();
   mode = null; myRole = null; myColor = 0; roomCode = '';
-  state = null; connecting = false; rematchSeen = '';
+  state = null; connecting = false; reqSeen = '';
   hideModal();
   setNetDot(false);
   $('input-code').value = '';
@@ -542,30 +677,6 @@ function fallbackCopy(done) {
   ta.select();
   try { document.execCommand('copy'); done(); } catch (e) { toast('Copy failed. Room code: ' + roomCode); }
   document.body.removeChild(ta);
-}
-
-/* ---------------- Rematch ---------------- */
-function onRematch() {
-  if (!state || state.status !== 'over' || state.rematchBy) return;
-  if (mode === 'host') hostRequestRematch();
-  else if (hostConn) hostConn.send({ t: 'rematch' });
-}
-function acceptRematch() {
-  hideModal();
-  if (mode === 'host') hostAcceptRematch();
-  else if (hostConn) hostConn.send({ t: 'rematch-accept' });
-}
-function declineRematch() {
-  hideModal();
-  if (mode === 'host') hostDeclineRematch();
-  else if (hostConn) hostConn.send({ t: 'rematch-decline' });
-}
-function onResign() {
-  showConfirm('Resign the game?', function () {
-    hideModal();
-    if (mode === 'host') hostResign();
-    else if (hostConn) hostConn.send({ t: 'resign' });
-  }, hideModal);
 }
 
 /* ---------------- Dialog ---------------- */
@@ -620,14 +731,12 @@ function onBoardTap(e) {
 function drawBoard() {
   if (!state) return;
   var s = boardSize;
-  // board background
   var g = ctx.createLinearGradient(0, 0, s, s);
   g.addColorStop(0, '#e2b968');
   g.addColorStop(1, '#d0a24e');
   ctx.fillStyle = g;
   roundRect(ctx, 0, 0, s, s, 14);
   ctx.fill();
-  // grid
   ctx.strokeStyle = 'rgba(74,52,28,0.9)';
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -637,10 +746,8 @@ function drawBoard() {
     ctx.moveTo(p, pad); ctx.lineTo(p, s - pad);
   }
   ctx.stroke();
-  // thicker border
   ctx.lineWidth = 2.5;
   ctx.strokeRect(pad, pad, s - pad * 2, s - pad * 2);
-  // star points
   var stars = [[3, 3], [3, 11], [11, 3], [11, 11], [7, 7]];
   ctx.fillStyle = 'rgba(74,52,28,0.95)';
   stars.forEach(function (pt) {
@@ -648,13 +755,11 @@ function drawBoard() {
     ctx.arc(pad + pt[0] * cell, pad + pt[1] * cell, Math.max(2.5, cell * 0.09), 0, Math.PI * 2);
     ctx.fill();
   });
-  // stones
   for (var y = 0; y < BOARD_SIZE; y++)
     for (var x = 0; x < BOARD_SIZE; x++) {
       var v = state.board[y][x];
       if (v !== EMPTY) drawStone(x, y, v);
     }
-  // winning line highlight
   if (state.winLine) {
     ctx.strokeStyle = '#e23c3c';
     ctx.lineWidth = Math.max(2, cell * 0.08);
@@ -664,7 +769,6 @@ function drawBoard() {
       ctx.stroke();
     });
   }
-  // last move marker
   if (state.lastMove) {
     var lm = state.lastMove;
     ctx.fillStyle = '#e23c3c';
@@ -699,29 +803,40 @@ function roundRect(c, x, y, w, h, r) {
   c.beginPath();
   c.moveTo(x + r, y);
   c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x, y, x + w, y, r);
   c.arcTo(x + w, y + h, x, y, r);
   c.arcTo(x, y + h, x, y, r);
   c.arcTo(x, y, x + w, y, r);
   c.closePath();
 }
 
-/* ---------------- Rendering: status / roster / buttons ---------------- */
+/* ---------------- Rendering: match / status / roster / buttons ---------------- */
 function renderAll() {
   if (!state) return;
   drawBoard();
+  renderMatchLine();
   renderStatus();
   renderRoster();
   renderActions();
-  // Opponent requested a rematch → show confirm dialog (once)
-  var needDialog = state.status === 'over' && state.rematchBy &&
-    state.rematchBy !== mySide() && (myRole === 'black' || myRole === 'white');
-  var key = state.rematchBy + ':' + state.moveCount;
-  if (needDialog && rematchSeen !== key) {
-    rematchSeen = key;
-    showConfirm(nameOf(state.rematchBy) + ' wants a rematch. Accept?', acceptRematch, declineRematch);
+  var rq = state.request;
+  var iPlayer = myRole === 'black' || myRole === 'white';
+  var needDialog = !!(rq && iPlayer && rq.by !== myRole);
+  var key = rq ? (rq.type + ':' + rq.by + ':' + state.round + ':' + state.moveCount) : '';
+  if (needDialog && reqSeen !== key) {
+    reqSeen = key;
+    showConfirm(nameOf(rq.by) + ' requests ' + reqName(rq.type) + '. Accept?', acceptRequest, declineRequest);
   } else if (!needDialog) {
     hideModal();
   }
+}
+
+function renderMatchLine() {
+  var el = $('match-line');
+  var b = state.players.black, w = state.players.white;
+  var bn = b ? b.name : '—', wn = w ? w.name : '—';
+  var bs = b ? (state.score[b.name] || 0) : 0;
+  var ws = w ? (state.score[w.name] || 0) : 0;
+  el.textContent = 'Game ' + state.round + '  ·  ' + bn + ' ' + bs + ' : ' + ws + ' ' + wn;
 }
 
 function renderStatus() {
@@ -741,7 +856,11 @@ function renderStatus() {
     else if (state.winner === myColor) main = 'You win! 🎉';
     else main = nameOf(state.winner === BLACK ? 'black' : 'white') + ' wins';
   }
-  if (state.notice) sub = state.notice;
+  if (state.request) {
+    sub = nameOf(state.request.by) + ' requests ' + reqName(state.request.type) + '…';
+  } else if (state.notice) {
+    sub = state.notice;
+  }
   bar.innerHTML = '<div class="main">' + esc(main) + '</div>' +
     (sub ? '<div class="sub">' + esc(sub) + '</div>' : '');
 }
@@ -763,11 +882,13 @@ function playerCard(side, color) {
   var p = state.players[side];
   var isTurn = state.status === 'playing' && state.turn === color;
   var isMe = (side === 'black' && myRole === 'black') || (side === 'white' && myRole === 'white');
+  var wins = p ? (state.score[p.name] || 0) : 0;
   return '<div class="player-card' + (isTurn ? ' turn' : '') + '">' +
     '<span class="stone-dot ' + (color === BLACK ? 'b' : 'w') + '"></span>' +
     '<span class="pinfo"><span class="pname">' + esc(p ? p.name : 'Waiting…') +
     (isMe ? ' (you)' : '') + '</span>' +
-    '<span class="pside">' + (color === BLACK ? 'Black · First move' : 'White') + '</span></span>' +
+    '<span class="pside">' + (color === BLACK ? 'Black · First move' : 'White') +
+    (p ? ' · ' + wins + (wins === 1 ? ' win' : ' wins') : '') + '</span></span>' +
     (isTurn ? '<span class="turn-dot"></span>' : '') +
     '</div>';
 }
@@ -784,11 +905,16 @@ function renderActions() {
     else b.addEventListener('click', fn);
     box.appendChild(b);
   };
-  if (iPlayer && state.status === 'playing') mk('Resign', 'btn-danger', onResign);
+  if (iPlayer && state.status === 'playing') {
+    var pending = !!state.request;
+    mk('Undo', 'btn-secondary', function () { sendRequest('undo'); }, pending || state.history.length === 0);
+    mk('Draw', 'btn-secondary', function () { sendRequest('draw'); }, pending);
+    mk('Resign', 'btn-danger', onResign, pending);
+  }
   if (iPlayer && state.status === 'over') {
-    if (state.rematchBy === mySide()) mk('Request sent, waiting…', 'btn-primary', null, true);
-    else if (state.rematchBy) mk('Rematch', 'btn-primary', null, true);
-    else mk('Rematch', 'btn-primary', onRematch);
+    var rq = state.request;
+    if (rq && rq.by === myRole) mk('Waiting…', 'btn-primary', null, true);
+    else mk('Rematch', 'btn-primary', function () { sendRequest('rematch'); }, !!rq);
   }
   mk('Leave room', 'btn-ghost', onLeave);
 }

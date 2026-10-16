@@ -55,6 +55,7 @@ body{
 .btn-big{width:100%;margin-top:6px;padding:15px}
 .btn-danger{background:transparent;border:1px solid var(--danger);color:var(--danger)}
 .btn-ghost{background:transparent;border:1px solid var(--line);color:var(--dim)}
+.btn-secondary{background:#232d44;border:1px solid var(--line);color:var(--text)}
 
 /* ---------- Room ---------- */
 .room-header{display:flex;align-items:center;gap:12px;margin-bottom:6px}
@@ -77,6 +78,7 @@ body{
 #status-bar{text-align:center;min-height:56px;margin:8px 0 4px}
 #status-bar .main{font-size:17px;font-weight:700}
 #status-bar .sub{font-size:13px;color:var(--dim);font-weight:400;margin-top:4px}
+#match-line{text-align:center;font-size:13px;color:var(--dim);font-weight:600;margin:4px 0 2px;letter-spacing:.5px}
 
 #board-wrap{width:100%;max-width:520px;margin:6px auto;touch-action:none}
 #board{display:block;width:100%;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.45)}
@@ -98,8 +100,8 @@ body{
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .spectators{text-align:center;color:var(--dim);font-size:13px;margin-top:10px;line-height:1.6}
 
-#actions{display:flex;gap:10px;margin-top:16px}
-#actions .btn{flex:1}
+#actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
+#actions .btn{flex:1 1 40%}
 
 /* ---------- Dialog ---------- */
 .modal{

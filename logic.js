@@ -72,7 +72,8 @@ function applyMove(state, x, y, color) {
   return { ok: true, winLine: winLine || null };
 }
 
-/* Initial game state (both seats taken) */
+/* Initial game state (both seats taken).
+ * Each seat: { name, holder } — holder is 'host', a host-side connection id, or null. */
 function newGameState(blackName, whiteName) {
   return {
     board: createBoard(),
@@ -82,9 +83,15 @@ function newGameState(blackName, whiteName) {
     winLine: null,
     lastMove: null,
     moveCount: 0,
-    players: { black: { name: blackName }, white: { name: whiteName } },
+    players: {
+      black: { name: blackName, holder: null },
+      white: whiteName ? { name: whiteName, holder: null } : null
+    },
     spectators: [],
-    rematchBy: null,
+    request: null, // { type: 'rematch'|'undo'|'draw', by: 'black'|'white' }
+    round: 1,
+    score: {},     // player name -> wins
+    history: [],   // [{x, y, color}] for undo
     notice: ''
   };
 }
@@ -96,7 +103,7 @@ function newWaitingState(blackName) {
   return s;
 }
 
-/* Reset the board for a rematch (seats are kept) */
+/* Reset the board for a rematch (seats, round and score are kept) */
 function resetBoard(state) {
   state.board = createBoard();
   state.turn = BLACK;
@@ -105,7 +112,8 @@ function resetBoard(state) {
   state.winLine = null;
   state.lastMove = null;
   state.moveCount = 0;
-  state.rematchBy = null;
+  state.request = null;
+  state.history = [];
   state.notice = '';
 }
 
