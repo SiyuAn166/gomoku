@@ -8,6 +8,15 @@
  * - The first to join the room = White (second move); sends move requests to host.
  * - Everyone joining after that = spectator; receives state only, cannot move.
  * - Room code is 4 chars; Peer ID is 'gomoku-' + room code.
+ *
+ * Seat robustness (fixed 2026-10-16):
+ * - Host tracks each DataConnection by a unique connection id, not by peer id,
+ *   so a duplicate/stale connection can never silently steal or block a seat.
+ * - A new connection from an already-seen peer replaces the old one (reconnect).
+ * - Heartbeat both directions: connections silent for >20s are treated as dead
+ *   and their seats are freed.
+ * - When the White seat frees up, the earliest spectator is auto-promoted,
+ *   keeping "first come, first seated".
  */
 
 var $ = function (id) { return document.getElementById(id); };
@@ -20,10 +29,17 @@ var myName = '';
 var roomCode = '';
 var peer = null;
 var hostConn = null;      // guest side: connection to the host
-var conns = new Map();    // host side: peerId -> { conn, name, role }
+var conns = new Map();    // host side: connId -> { conn, name, role, lastPong, replaced }
+var peerToConn = {};      // host side: peerId -> connId (one live connection per peer)
+var whiteConnId = null;   // connId currently holding the White seat
+var whitePeerId = null;   // peerId currently holding the White seat
 var state = null;         // local copy of state (authoritative on host side)
 var rematchSeen = '';     // marker of the rematch dialog already shown
 var connecting = false;
+var hbTimer = null;       // host heartbeat interval
+var hostHbTimer = null;   // guest watchdog interval
+var lastHostPong = 0;
+var cidSeq = 0;
 
 /* ---------------- Helpers ---------------- */
 function esc(s) {
@@ -64,6 +80,10 @@ function makeCode() {
   for (var i = 0; i < 4; i++) s += abc[Math.floor(Math.random() * abc.length)];
   return s;
 }
+function connIdOf(conn) {
+  if (!conn._cid) conn._cid = conn.connectionId || ('c' + (++cidSeq) + '_' + conn.peer);
+  return conn._cid;
+}
 
 /* ---------------- Screens ---------------- */
 function showScreen(id) {
@@ -101,10 +121,23 @@ function setNetDot(on) {
 /* ---------------- Host ---------------- */
 function createRoom() {
   if (typeof Peer === 'undefined') { toast('Failed to load network module. Check your connection and refresh.'); return; }
+  resetNetState();
   connecting = true;
   mode = 'host';
   roomCode = makeCode();
   openHostPeer();
+}
+
+function resetNetState() {
+  try { if (peer) peer.destroy(); } catch (e) {}
+  peer = null;
+  hostConn = null;
+  conns.clear();
+  peerToConn = {};
+  whiteConnId = null;
+  whitePeerId = null;
+  stopHeartbeat();
+  stopHostWatchdog();
 }
 
 function openHostPeer() {
@@ -116,6 +149,7 @@ function openHostPeer() {
     state = newWaitingState(myName);
     setNetDot(true);
     enterRoom();
+    startHeartbeat();
     toast('Room created — share the code with your friend!');
   });
   peer.on('connection', onGuestConnected);
@@ -139,12 +173,25 @@ function openHostPeer() {
 }
 
 function onGuestConnected(conn) {
+  var id = connIdOf(conn);
   conn.on('open', function () {
-    conns.set(conn.peer, { conn: conn, name: '', role: '' });
+    // A new connection from an already-seen peer replaces the old one
+    // (handles re-join / duplicate connections without ghost seats).
+    var oldId = peerToConn[conn.peer];
+    if (oldId && oldId !== id) {
+      var oldRec = conns.get(oldId);
+      if (oldRec) {
+        oldRec.replaced = true;
+        conns.delete(oldId);
+        try { oldRec.conn.close(); } catch (e) {}
+      }
+    }
+    conns.set(id, { conn: conn, name: '', role: '', lastPong: Date.now(), replaced: false });
+    peerToConn[conn.peer] = id;
   });
   conn.on('data', function (msg) { handleGuestMessage(conn, msg || {}); });
-  conn.on('close', function () { onGuestLeft(conn.peer); });
-  conn.on('error', function () { onGuestLeft(conn.peer); });
+  conn.on('close', function () { onGuestLeft(conn); });
+  conn.on('error', function () { onGuestLeft(conn); });
 }
 
 function sendTo(rec, msg) {
@@ -160,8 +207,11 @@ function broadcastState() {
 }
 
 function handleGuestMessage(conn, msg) {
-  var rec = conns.get(conn.peer);
-  if (!rec) return;
+  var rec = conns.get(connIdOf(conn));
+  if (!rec || rec.replaced) return;
+
+  if (msg.t === 'ping') { sendTo(rec, { t: 'pong' }); return; }
+  if (msg.t === 'pong') { rec.lastPong = Date.now(); return; }
 
   if (msg.t === 'hello') {
     if (rec.role) { // duplicate hello: resend welcome packet
@@ -170,14 +220,19 @@ function handleGuestMessage(conn, msg) {
     }
     var name = clampName(msg.name) || 'Player';
     rec.name = name;
-    if (!state.players.white) {
+    // The White seat is free if nobody holds it, if the holder's connection
+    // is gone, or if this is the same peer reconnecting.
+    var whiteAlive = !!(whiteConnId && conns.has(whiteConnId) && state.players.white);
+    if (!whiteAlive || whitePeerId === conn.peer) {
       rec.role = 'white';
       state.players.white = { name: name };
+      whiteConnId = connIdOf(conn);
+      whitePeerId = conn.peer;
       if (state.status === 'waiting') { state.status = 'playing'; state.notice = ''; }
       toast(name + ' took the White seat');
     } else {
       rec.role = 'spectator';
-      state.spectators.push({ id: conn.peer, name: name });
+      state.spectators.push({ id: connIdOf(conn), name: name });
       toast(name + ' joined as spectator');
     }
     sendTo(rec, { t: 'welcome', role: rec.role, state: state });
@@ -232,12 +287,18 @@ function handleGuestMessage(conn, msg) {
   }
 }
 
-function onGuestLeft(peerId) {
-  var rec = conns.get(peerId);
-  conns.delete(peerId);
-  if (!rec || !rec.role) return;
+function onGuestLeft(conn) {
+  var id = connIdOf(conn);
+  var rec = conns.get(id);
+  if (!rec) return;
+  conns.delete(id);
+  if (peerToConn[conn.peer] === id) delete peerToConn[conn.peer];
+  if (rec.replaced) return; // superseded by a newer connection; the seat stays
   if (rec.role === 'white') {
+    var name = rec.name || 'White';
     state.players.white = null;
+    whiteConnId = null;
+    whitePeerId = null;
     state.rematchBy = null;
     if (state.status === 'playing') {
       // White left mid-game: clear the board and wait for a new challenger
@@ -248,16 +309,55 @@ function onGuestLeft(peerId) {
       state.winLine = null;
       state.lastMove = null;
       state.moveCount = 0;
-      state.notice = rec.name + ' left. Waiting for a new challenger.';
-    } else {
-      state.notice = rec.name + ' left';
     }
-    toast(rec.name + ' left the room');
-  } else {
-    state.spectators = state.spectators.filter(function (s) { return s.id !== peerId; });
+    state.notice = name + ' left the room';
+    toast(name + ' left the room');
+    promoteSpectator();
+    if (state.status === 'waiting' && state.players.black && state.players.white) {
+      state.status = 'playing';
+      state.notice = '';
+    }
+  } else if (rec.role === 'spectator') {
+    state.spectators = state.spectators.filter(function (s) { return s.id !== id; });
     toast(rec.name + ' stopped spectating');
   }
   broadcastState();
+}
+
+/* First spectator in line takes the freed White seat ("first come, first seated"). */
+function promoteSpectator() {
+  var sp = state.spectators;
+  if (!sp.length) return;
+  var next = sp.shift();
+  var rec = conns.get(next.id);
+  if (!rec || rec.replaced) { promoteSpectator(); return; }
+  rec.role = 'white';
+  state.players.white = { name: rec.name };
+  whiteConnId = next.id;
+  whitePeerId = rec.conn.peer;
+  sendTo(rec, { t: 'welcome', role: 'white', state: state });
+  toast(rec.name + ' took the White seat');
+}
+
+/* Host heartbeat: reap connections silent for >20s (ghost peers). */
+function startHeartbeat() {
+  stopHeartbeat();
+  hbTimer = setInterval(function () {
+    if (mode !== 'host') return;
+    var now = Date.now();
+    conns.forEach(function (rec, id) {
+      if (rec.replaced) { conns.delete(id); return; }
+      if (now - rec.lastPong > 20000) {
+        try { rec.conn.close(); } catch (e) {}
+        onGuestLeft(rec.conn); // ensure cleanup even if the close event is lost
+      } else {
+        try { rec.conn.send({ t: 'ping' }); } catch (e) {}
+      }
+    });
+  }, 8000);
+}
+function stopHeartbeat() {
+  if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
 }
 
 /* Host (Black) own actions */
@@ -297,6 +397,7 @@ function hostDeclineRematch() {
 /* ---------------- Guest (White / spectator) ---------------- */
 function joinRoom(code) {
   if (typeof Peer === 'undefined') { toast('Failed to load network module. Check your connection and refresh.'); return; }
+  resetNetState();
   connecting = true;
   mode = 'guest';
   roomCode = code;
@@ -329,11 +430,14 @@ function wireHostConn() {
     clearTimeout(connTimer);
     connecting = false;
     setNetDot(true);
+    lastHostPong = Date.now();
+    startHostWatchdog();
     hostConn.send({ t: 'hello', name: myName });
   });
   hostConn.on('data', function (msg) { onHostMessage(msg || {}); });
   hostConn.on('close', function () {
     clearTimeout(connTimer);
+    stopHostWatchdog();
     if (mode === 'guest') {
       toast('The host left the room');
       cleanupToHome();
@@ -344,7 +448,27 @@ function wireHostConn() {
   });
 }
 
+/* Guest watchdog: if the host goes silent for >20s, leave the room. */
+function startHostWatchdog() {
+  stopHostWatchdog();
+  hostHbTimer = setInterval(function () {
+    if (mode !== 'guest' || !hostConn) return;
+    if (Date.now() - lastHostPong > 20000) {
+      stopHostWatchdog();
+      toast('Lost connection to host');
+      cleanupToHome();
+      return;
+    }
+    try { hostConn.send({ t: 'ping' }); } catch (e) {}
+  }, 8000);
+}
+function stopHostWatchdog() {
+  if (hostHbTimer) { clearInterval(hostHbTimer); hostHbTimer = null; }
+}
+
 function onHostMessage(msg) {
+  if (msg.t === 'ping') { try { hostConn.send({ t: 'pong' }); } catch (e) {} return; }
+  if (msg.t === 'pong') { lastHostPong = Date.now(); return; }
   if (msg.t === 'welcome') {
     myRole = msg.role;
     myColor = msg.role === 'black' ? BLACK : msg.role === 'white' ? WHITE : 0;
@@ -391,10 +515,9 @@ function enterRoom() {
 function cleanupToHome() {
   try { if (hostConn) hostConn.close(); } catch (e) {}
   conns.forEach(function (rec) { try { rec.conn.close(); } catch (e) {} });
-  conns.clear();
-  hostConn = null;
-  try { if (peer) peer.destroy(); } catch (e) {}
-  peer = null;
+  stopHeartbeat();
+  stopHostWatchdog();
+  resetNetState();
   mode = null; myRole = null; myColor = 0; roomCode = '';
   state = null; connecting = false; rematchSeen = '';
   hideModal();
@@ -576,7 +699,7 @@ function roundRect(c, x, y, w, h, r) {
   c.beginPath();
   c.moveTo(x + r, y);
   c.arcTo(x + w, y, x + w, y + h, r);
-  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x + w, y + h, x, y, r);
   c.arcTo(x, y + h, x, y, r);
   c.arcTo(x, y, x + w, y, r);
   c.closePath();
