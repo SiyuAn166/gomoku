@@ -39,6 +39,7 @@ var conns = new Map();    // host side: connId -> { conn, name, role, lastPong, 
 var peerToConn = {};      // host side: peerId -> connId (one live connection per peer)
 var state = null;         // local copy of state (authoritative on host side)
 var reqSeen = '';         // marker of the request dialog already shown
+var reqSeq = 0;           // increments per request so repeated requests always re-show the dialog
 var connecting = false;
 var hbTimer = null;       // host heartbeat interval
 var hostHbTimer = null;   // guest watchdog interval
@@ -216,22 +217,39 @@ function openHostPeer() {
 
 function onGuestConnected(conn) {
   var id = connIdOf(conn);
-  conn.on('open', function () {
-    var oldId = peerToConn[conn.peer];
-    if (oldId && oldId !== id) {
-      var oldRec = conns.get(oldId);
-      if (oldRec) {
-        oldRec.replaced = true;
-        conns.delete(oldId);
-        try { oldRec.conn.close(); } catch (e) {}
-      }
+  // Register immediately on 'connection' — do NOT wait for 'open'.
+  // The guest sends its hello as soon as its side opens, which can win the
+  // race; a hello arriving before our 'open' must not be dropped.
+  // A new connection from an already-seen peer replaces the old one
+  // (handles re-join / duplicate connections without ghost seats).
+  var oldId = peerToConn[conn.peer];
+  if (oldId && oldId !== id) {
+    var oldRec = conns.get(oldId);
+    if (oldRec) {
+      oldRec.replaced = true;
+      conns.delete(oldId);
+      try { oldRec.conn.close(); } catch (e) {}
     }
-    conns.set(id, { conn: conn, name: '', role: '', lastPong: Date.now(), replaced: false });
-    peerToConn[conn.peer] = id;
-  });
+  }
+  conns.set(id, { conn: conn, name: '', role: '', lastPong: Date.now(), replaced: false });
+  peerToConn[conn.peer] = id;
   conn.on('data', function (msg) { handleGuestMessage(conn, msg || {}); });
   conn.on('close', function () { onGuestLeft(conn); });
   conn.on('error', function () { onGuestLeft(conn); });
+}
+
+/* Reply with the welcome packet (and the following broadcast) as soon as the
+ * channel is actually open; PeerJS may drop sends issued before 'open'. */
+function sendWelcome(rec, conn) {
+  var id = connIdOf(conn);
+  var doIt = function () {
+    var r = conns.get(id);
+    if (!r || r.replaced) return;
+    sendTo(r, { t: 'welcome', role: r.role, state: state });
+    broadcastState();
+  };
+  if (conn.open) doIt();
+  else conn.on('open', doIt);
 }
 
 function sendTo(rec, msg) {
@@ -241,6 +259,7 @@ function sendTo(rec, msg) {
 function broadcastState() {
   var snap = snapshot({ t: 'state', state: state });
   conns.forEach(function (rec) {
+    if (!rec.conn.open) return; // not ready yet; they get full state via welcome
     try { rec.conn.send(snap); } catch (e) {}
   });
   renderAll();
@@ -255,10 +274,7 @@ function handleGuestMessage(conn, msg) {
   if (msg.t === 'pong') { rec.lastPong = Date.now(); return; }
 
   if (msg.t === 'hello') {
-    if (rec.role) {
-      sendTo(rec, { t: 'welcome', role: rec.role, state: state });
-      return;
-    }
+    if (rec.role) { sendWelcome(rec, conn); return; }
     var name = uniqueName(clampName(msg.name) || 'Player', id);
     rec.name = name;
     var seat = freeSeat();
@@ -275,8 +291,7 @@ function handleGuestMessage(conn, msg) {
       state.spectators.push({ id: id, name: name });
       toast(name + ' joined as spectator');
     }
-    sendTo(rec, { t: 'welcome', role: rec.role, state: state });
-    broadcastState();
+    sendWelcome(rec, conn);
     return;
   }
 
@@ -305,7 +320,7 @@ function handleGuestMessage(conn, msg) {
 
   if (msg.t === 'request') {
     if (!validRequest(rec.role, msg.type)) return;
-    state.request = { type: msg.type, by: rec.role };
+    state.request = { type: msg.type, by: rec.role, seq: ++reqSeq };
     broadcastState();
     return;
   }
@@ -494,7 +509,7 @@ function endByResign(seat) {
 function sendRequest(type) {
   if (mode === 'host') {
     if (!validRequest(hostSeat(), type)) return;
-    state.request = { type: type, by: hostSeat() };
+    state.request = { type: type, by: hostSeat(), seq: ++reqSeq };
     broadcastState();
   } else if (hostConn) {
     hostConn.send({ t: 'request', type: type });
@@ -821,7 +836,8 @@ function renderAll() {
   var rq = state.request;
   var iPlayer = myRole === 'black' || myRole === 'white';
   var needDialog = !!(rq && iPlayer && rq.by !== myRole);
-  var key = rq ? (rq.type + ':' + rq.by + ':' + state.round + ':' + state.moveCount) : '';
+  if (!rq) reqSeen = '';
+  var key = rq ? (rq.type + ':' + rq.by + ':' + rq.seq) : '';
   if (needDialog && reqSeen !== key) {
     reqSeen = key;
     showConfirm(nameOf(rq.by) + ' requests ' + reqName(rq.type) + '. Accept?', acceptRequest, declineRequest);
