@@ -30,7 +30,7 @@ body{
   background:var(--card);border:1px solid var(--line);border-radius:12px;outline:none;
 }
 .input:focus{border-color:var(--accent)}
-@media (hover:hover){ .input:hover{border-color:#3d4b6e} }
+.input:hover{border-color:#3d4b6e}
 .code-input{letter-spacing:8px;text-align:center;font-weight:700;font-size:20px;text-transform:uppercase}
 .join-row{display:flex;gap:10px}
 .join-row .input{flex:1}
@@ -54,14 +54,12 @@ body{
 }
 .btn:disabled{opacity:.45;cursor:not-allowed;transform:none;box-shadow:none}
 .btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-/* Hover feedback only where a real hover exists (no sticky hover on touch). */
-@media (hover:hover){
-  .btn:not(:disabled):hover{transform:translateY(-1px);border-color:#3d4b6e;box-shadow:0 6px 16px rgba(0,0,0,.35)}
-  .btn-primary:not(:disabled):hover{background:#ffc95e;box-shadow:0 6px 22px rgba(245,185,66,.35)}
-  .btn-secondary:not(:disabled):hover{background:#2b3754}
-  .btn-ghost:not(:disabled):hover{color:var(--text);border-color:var(--dim)}
-  .btn-danger:not(:disabled):hover{background:rgba(229,96,94,.14);box-shadow:0 6px 16px rgba(229,96,94,.20)}
-}
+/* Hover feedback (on touch screens it shows while the finger is down). */
+.btn:not(:disabled):hover{transform:translateY(-1px);border-color:#3d4b6e;box-shadow:0 6px 16px rgba(0,0,0,.35)}
+.btn-primary:not(:disabled):hover{background:#ffc95e;box-shadow:0 6px 22px rgba(245,185,66,.35)}
+.btn-secondary:not(:disabled):hover{background:#2b3754}
+.btn-ghost:not(:disabled):hover{color:var(--text);border-color:var(--dim)}
+.btn-danger:not(:disabled):hover{background:rgba(229,96,94,.14);box-shadow:0 6px 16px rgba(229,96,94,.20)}
 /* Pressed state wins over hover. */
 .btn:not(:disabled):active{transform:translateY(0) scale(.96);box-shadow:0 2px 8px rgba(0,0,0,.3)}
 .btn-primary{background:var(--accent);color:var(--accent-d);border:none;flex-direction:column;line-height:1.3}
@@ -82,9 +80,7 @@ body{
   transition:color .18s ease, text-shadow .18s ease, transform .1s ease;
 }
 .room-code:active{transform:scale(.96)}
-@media (hover:hover){
-  .room-code:hover{color:#ffc95e;text-shadow:0 0 20px rgba(245,185,66,.45)}
-}
+.room-code:hover{color:#ffc95e;text-shadow:0 0 20px rgba(245,185,66,.45)}
 .role-badge{
   font-size:13px;font-weight:700;padding:6px 12px;border-radius:999px;white-space:nowrap;
   background:var(--card);border:1px solid var(--line);color:var(--dim);
