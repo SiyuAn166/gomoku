@@ -18,7 +18,9 @@ body{
 /* ---------- Home ---------- */
 .hero{display:flex;align-items:center;justify-content:center;gap:16px;margin:28px 0 8px}
 .hero h1{font-size:52px;font-weight:800;letter-spacing:12px;margin-right:-12px}
-.hero-stone{width:44px;height:44px;border-radius:50%;box-shadow:0 4px 10px rgba(0,0,0,.4)}
+.hero-stone{width:44px;height:44px;border-radius:50%;box-shadow:0 4px 10px rgba(0,0,0,.4);animation:float 3.4s ease-in-out infinite}
+.hero-stone.w{animation-delay:-1.7s}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
 .hero-stone.b{background:radial-gradient(circle at 32% 30%,#6b7280,#0b0d10)}
 .hero-stone.w{background:radial-gradient(circle at 32% 30%,#fff,#c3c9d2)}
 .subtitle{text-align:center;color:var(--dim);font-size:14px;margin-bottom:28px}
@@ -28,6 +30,7 @@ body{
   background:var(--card);border:1px solid var(--line);border-radius:12px;outline:none;
 }
 .input:focus{border-color:var(--accent)}
+@media (hover:hover){ .input:hover{border-color:#3d4b6e} }
 .code-input{letter-spacing:8px;text-align:center;font-weight:700;font-size:20px;text-transform:uppercase}
 .join-row{display:flex;gap:10px}
 .join-row .input{flex:1}
@@ -41,14 +44,26 @@ body{
 
 /* ---------- Buttons ---------- */
 .btn{
-  border:none;border-radius:12px;font-size:16px;font-weight:700;
+  border:1px solid var(--line);border-radius:12px;font-size:16px;font-weight:700;
   padding:13px 18px;cursor:pointer;color:var(--text);
-  background:var(--card);border:1px solid var(--line);
+  background:var(--card);
   display:inline-flex;align-items:center;justify-content:center;gap:8px;
-  transition:transform .08s ease, opacity .15s;
+  transition:transform .1s ease, background-color .18s ease, border-color .18s ease,
+             color .18s ease, box-shadow .18s ease, opacity .15s ease;
+  touch-action:manipulation;
 }
-.btn:active{transform:scale(.97)}
-.btn:disabled{opacity:.55;cursor:default}
+.btn:disabled{opacity:.45;cursor:not-allowed;transform:none;box-shadow:none}
+.btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+/* Hover feedback only where a real hover exists (no sticky hover on touch). */
+@media (hover:hover){
+  .btn:not(:disabled):hover{transform:translateY(-1px);border-color:#3d4b6e;box-shadow:0 6px 16px rgba(0,0,0,.35)}
+  .btn-primary:not(:disabled):hover{background:#ffc95e;box-shadow:0 6px 22px rgba(245,185,66,.35)}
+  .btn-secondary:not(:disabled):hover{background:#2b3754}
+  .btn-ghost:not(:disabled):hover{color:var(--text);border-color:var(--dim)}
+  .btn-danger:not(:disabled):hover{background:rgba(229,96,94,.14);box-shadow:0 6px 16px rgba(229,96,94,.20)}
+}
+/* Pressed state wins over hover. */
+.btn:not(:disabled):active{transform:translateY(0) scale(.96);box-shadow:0 2px 8px rgba(0,0,0,.3)}
 .btn-primary{background:var(--accent);color:var(--accent-d);border:none;flex-direction:column;line-height:1.3}
 .btn-primary .btn-sub{font-size:12px;font-weight:500;opacity:.75}
 .join-row .btn-primary{flex-direction:row}
@@ -63,7 +78,12 @@ body{
 .room-code-label{font-size:11px;color:var(--dim);margin-bottom:2px}
 .room-code{
   font-size:30px;font-weight:800;letter-spacing:8px;color:var(--accent);
-  cursor:pointer;line-height:1.2;
+  cursor:pointer;line-height:1.2;display:inline-block;
+  transition:color .18s ease, text-shadow .18s ease, transform .1s ease;
+}
+.room-code:active{transform:scale(.96)}
+@media (hover:hover){
+  .room-code:hover{color:#ffc95e;text-shadow:0 0 20px rgba(245,185,66,.45)}
 }
 .role-badge{
   font-size:13px;font-weight:700;padding:6px 12px;border-radius:999px;white-space:nowrap;
@@ -87,6 +107,7 @@ body{
 .player-card{
   display:flex;align-items:center;gap:10px;background:var(--card);
   border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin-bottom:8px;
+  transition:border-color .25s ease, box-shadow .25s ease;
 }
 .player-card.turn{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
 .vs{text-align:center;color:var(--dim);font-size:11px;letter-spacing:4px;margin:2px 0 8px;font-weight:700}
@@ -107,7 +128,9 @@ body{
 .modal{
   position:fixed;inset:0;background:rgba(4,7,14,.65);z-index:50;
   display:flex;align-items:center;justify-content:center;padding:20px;
+  animation:fadein .18s ease;
 }
+@keyframes fadein{from{opacity:0}to{opacity:1}}
 .modal.hidden{display:none}
 .modal-card{
   background:var(--card);border:1px solid var(--line);border-radius:16px;
