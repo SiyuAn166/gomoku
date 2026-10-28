@@ -44,6 +44,21 @@ var connecting = false;
 var netTimer = null;      // join/create deadline timer (covers every silent stall)
 var netStage = '';        // 'creating' | 'signaling' | 'connecting' | 'waiting-welcome'
 var NET_TIMEOUT_MS = 15000;
+/* ICE servers: Google STUN for direct connections plus a public TURN relay
+ * as fallback. Without TURN, two phones behind symmetric NATs (common on
+ * cellular networks) cannot establish a WebRTC connection at all — the join
+ * just times out at the 'connecting' stage. TURN only relays encrypted
+ * WebRTC traffic; it cannot read game data. Adding it is strictly additive:
+ * if the relay is unreachable, behavior is unchanged. */
+var ICE_CONFIG = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:openrelay.metered.ca:80' },
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+  ]
+};
 var hbTimer = null;       // host heartbeat interval
 var hostHbTimer = null;   // guest watchdog interval
 var lastHostPong = 0;
@@ -92,10 +107,19 @@ function onNetTimeout() {
   var msg =
     netStage === 'creating' ? 'Could not create a room: cannot reach the signaling server. Check your connection and try again.' :
     netStage === 'signaling' ? 'Could not reach the signaling server. Check your connection and try again.' :
-    netStage === 'connecting' ? 'Connection timed out. The host may be offline, or the room code may be wrong.' :
+    netStage === 'connecting' ? connectingTimeoutMsg() :
     'Connected, but the host did not respond. The host may have locked their phone, left, or lost connection — ask them to recreate the room.';
   toast(msg, 6000);
   cleanupToHome();
+}
+/* Tailor the 'connecting' timeout: an ICE 'failed' state means the networks
+ * could not link the phones (NAT/firewall), while anything else means the
+ * host simply never answered. */
+function connectingTimeoutMsg() {
+  var ice = '';
+  try { ice = hostConn && hostConn.peerConnection && hostConn.peerConnection.iceConnectionState; } catch (e) {}
+  if (ice === 'failed') return 'Connection failed: the two phones could not link directly or via relay. Try both phones on the same WiFi, with the host page open in the foreground.';
+  return 'Connection timed out. The host may not be responding — keep the host page open in the foreground — or the room code may be wrong.';
 }
 function setJoinBusy(busy) {
   var b = $('btn-join');
@@ -218,7 +242,7 @@ function resetNetState() {
 }
 
 function openHostPeer() {
-  peer = new Peer('gomoku-' + roomCode);
+  peer = new Peer('gomoku-' + roomCode, { config: ICE_CONFIG });
   peer.on('open', function () {
     connecting = false;
     clearNetTimer();
@@ -584,7 +608,7 @@ function joinRoom(code) {
   roomCode = code;
   setJoinBusy(true);
   startNetTimer('signaling');
-  peer = new Peer(); // random ID
+  peer = new Peer({ config: ICE_CONFIG }); // random ID
   peer.on('open', function () {
     netStage = 'connecting';
     hostConn = peer.connect('gomoku-' + roomCode, { reliable: true });
