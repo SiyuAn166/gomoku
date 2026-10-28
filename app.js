@@ -41,6 +41,9 @@ var state = null;         // local copy of state (authoritative on host side)
 var reqSeen = '';         // marker of the request dialog already shown
 var reqSeq = 0;           // increments per request so repeated requests always re-show the dialog
 var connecting = false;
+var netTimer = null;      // join/create deadline timer (covers every silent stall)
+var netStage = '';        // 'creating' | 'signaling' | 'connecting' | 'waiting-welcome'
+var NET_TIMEOUT_MS = 15000;
 var hbTimer = null;       // host heartbeat interval
 var hostHbTimer = null;   // guest watchdog interval
 var lastHostPong = 0;
@@ -55,7 +58,7 @@ function esc(s) {
 function clampName(s) {
   return String(s || '').trim().slice(0, 12);
 }
-function toast(msg) {
+function toast(msg, ms) {
   var wrap = $('toast-wrap');
   var d = document.createElement('div');
   d.className = 'toast';
@@ -65,12 +68,41 @@ function toast(msg) {
   setTimeout(function () {
     d.classList.add('out');
     setTimeout(function () { if (d.parentNode) d.parentNode.removeChild(d); }, 300);
-  }, 2200);
+  }, ms || 2200);
 }
 function vibrate(ms) {
   try { if (navigator.vibrate) navigator.vibrate(ms || 15); } catch (e) {}
 }
 function snapshot(s) { return JSON.parse(JSON.stringify(s)); }
+
+/* Join/create progress: one deadline timer covers the whole flow, so a stall
+ * at ANY stage (signaling unreachable, host unreachable, host never replies
+ * to hello) ends with a visible, actionable error instead of a dead screen.
+ * netStage names the stage so the message can say what actually got stuck. */
+function startNetTimer(stage) {
+  clearNetTimer();
+  netStage = stage;
+  netTimer = setTimeout(onNetTimeout, NET_TIMEOUT_MS);
+}
+function clearNetTimer() {
+  if (netTimer) { clearTimeout(netTimer); netTimer = null; }
+  netStage = '';
+}
+function onNetTimeout() {
+  var msg =
+    netStage === 'creating' ? 'Could not create a room: cannot reach the signaling server. Check your connection and try again.' :
+    netStage === 'signaling' ? 'Could not reach the signaling server. Check your connection and try again.' :
+    netStage === 'connecting' ? 'Connection timed out. The host may be offline, or the room code may be wrong.' :
+    'Connected, but the host did not respond. The host may have locked their phone, left, or lost connection — ask them to recreate the room.';
+  toast(msg, 6000);
+  cleanupToHome();
+}
+function setJoinBusy(busy) {
+  var b = $('btn-join');
+  b.disabled = busy;
+  b.textContent = busy ? 'Joining…' : 'Join';
+}
+function setCreateBusy(busy) { $('btn-create').disabled = busy; }
 function mySide() {
   return myRole === 'black' ? 'black' : myRole === 'white' ? 'white' : 'spectator';
 }
@@ -170,6 +202,8 @@ function createRoom() {
   connecting = true;
   mode = 'host';
   roomCode = makeCode();
+  setCreateBusy(true);
+  startNetTimer('creating');
   openHostPeer();
 }
 
@@ -187,6 +221,7 @@ function openHostPeer() {
   peer = new Peer('gomoku-' + roomCode);
   peer.on('open', function () {
     connecting = false;
+    clearNetTimer();
     state = newWaitingState(myName);
     state.players.black.holder = 'host';
     myRole = 'black';
@@ -547,8 +582,11 @@ function joinRoom(code) {
   connecting = true;
   mode = 'guest';
   roomCode = code;
+  setJoinBusy(true);
+  startNetTimer('signaling');
   peer = new Peer(); // random ID
   peer.on('open', function () {
+    netStage = 'connecting';
     hostConn = peer.connect('gomoku-' + roomCode, { reliable: true });
     wireHostConn();
   });
@@ -560,21 +598,18 @@ function joinRoom(code) {
     connecting = false;
     setNetDot(false);
     if (err && err.type === 'peer-unavailable') {
-      toast('Room not found. Check the room code.');
+      toast('Room not found. Check the room code.', 6000);
     } else {
-      toast('Failed to join: ' + errTypeText(err));
+      toast('Failed to join: ' + errTypeText(err), 6000);
     }
     cleanupToHome();
   });
 }
 
 function wireHostConn() {
-  var connTimer = setTimeout(function () {
-    if (connecting) { toast('Connection timed out. Make sure the host is online and the code is correct.'); cleanupToHome(); }
-  }, 12000);
   hostConn.on('open', function () {
-    clearTimeout(connTimer);
     connecting = false;
+    netStage = 'waiting-welcome';
     setNetDot(true);
     lastHostPong = Date.now();
     startHostWatchdog();
@@ -582,16 +617,13 @@ function wireHostConn() {
   });
   hostConn.on('data', function (msg) { onHostMessage(msg || {}); });
   hostConn.on('close', function () {
-    clearTimeout(connTimer);
     stopHostWatchdog();
     if (mode === 'guest') {
       toast('The host left the room');
       cleanupToHome();
     }
   });
-  hostConn.on('error', function () {
-    clearTimeout(connTimer);
-  });
+  hostConn.on('error', function () {});
 }
 
 /* Guest watchdog: if the host goes silent for >20s, leave the room. */
@@ -616,6 +648,7 @@ function onHostMessage(msg) {
   if (msg.t === 'ping') { try { hostConn.send({ t: 'pong' }); } catch (e) {} return; }
   if (msg.t === 'pong') { lastHostPong = Date.now(); return; }
   if (msg.t === 'welcome') {
+    clearNetTimer();
     myRole = msg.role;
     myColor = msg.role === 'black' ? BLACK : msg.role === 'white' ? WHITE : 0;
     state = msg.state;
@@ -653,6 +686,8 @@ function errTypeText(err) {
 /* ---------------- Shared: enter / leave ---------------- */
 function enterRoom() {
   reqSeen = '';
+  setJoinBusy(false);
+  setCreateBusy(false);
   hideModal();
   $('room-code').textContent = roomCode;
   var badge = $('role-badge');
@@ -663,13 +698,24 @@ function enterRoom() {
 }
 
 function cleanupToHome() {
-  try { if (hostConn) hostConn.close(); } catch (e) {}
-  conns.forEach(function (rec) { try { rec.conn.close(); } catch (e) {} });
+  clearNetTimer();
+  setJoinBusy(false);
+  setCreateBusy(false);
+  // Clear state BEFORE closing connections, so the close handlers fired by
+  // those closes see a torn-down room and stay quiet (no duplicate toasts,
+  // no re-entrant cleanup, no seat shuffling on a room being left).
+  var hc = hostConn;
+  var all = [];
+  conns.forEach(function (rec) { all.push(rec.conn); });
+  conns.clear();
+  peerToConn = {};
+  mode = null; myRole = null; myColor = 0; roomCode = '';
+  state = null; connecting = false; reqSeen = '';
+  try { if (hc) hc.close(); } catch (e) {}
+  all.forEach(function (c) { try { c.close(); } catch (e) {} });
   stopHeartbeat();
   stopHostWatchdog();
   resetNetState();
-  mode = null; myRole = null; myColor = 0; roomCode = '';
-  state = null; connecting = false; reqSeen = '';
   hideModal();
   setNetDot(false);
   $('input-code').value = '';
@@ -731,8 +777,10 @@ function resizeBoard() {
 }
 
 function onBoardTap(e) {
-  if (!state || state.status !== 'playing') return;
-  if (myRole !== 'black' && myRole !== 'white') return; // spectators cannot move
+  if (!state) return;
+  if (state.status === 'waiting') { toast('Waiting for opponent to join'); return; }
+  if (state.status !== 'playing') return;
+  if (myRole !== 'black' && myRole !== 'white') { toast('Spectators cannot move'); return; }
   if (state.turn !== myColor) { toast('Not your turn'); return; }
   var rect = canvas.getBoundingClientRect();
   var px = e.clientX - rect.left, py = e.clientY - rect.top;
