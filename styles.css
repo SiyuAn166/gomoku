@@ -114,6 +114,10 @@ body{
 .pinfo{flex:1;display:flex;flex-direction:column;gap:2px;min-width:0}
 .pname{font-size:15px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pside{font-size:12px;color:var(--dim)}
+.plink{font-size:12px;font-weight:600}
+.plink.on{color:#3ddc84}
+.plink.weak{color:#f5b942}
+.plink.off{color:#e5605e}
 .turn-dot{width:9px;height:9px;border-radius:50%;background:var(--accent);flex-shrink:0;animation:pulse 1.2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .spectators{text-align:center;color:var(--dim);font-size:13px;margin-top:10px;line-height:1.6}

@@ -127,6 +127,7 @@ function setJoinBusy(busy) {
   b.textContent = busy ? 'Joining…' : 'Join';
 }
 function setCreateBusy(busy) { $('btn-create').disabled = busy; }
+function setJoinStatus(t) { var b = $('join-status'); if (b) b.textContent = t || ''; }
 
 /* Local network info: gather ICE candidates from a throwaway connection and
  * show the device's LAN address, so two players can check they share a WiFi.
@@ -278,6 +279,7 @@ function createRoom() {
   roomCode = makeCode();
   setCreateBusy(true);
   startNetTimer('creating');
+  setJoinStatus('Creating room…');
   openHostPeer();
 }
 
@@ -380,7 +382,7 @@ function handleGuestMessage(conn, msg) {
   if (!rec || rec.replaced) return;
 
   if (msg.t === 'ping') { sendTo(rec, { t: 'pong' }); return; }
-  if (msg.t === 'pong') { rec.lastPong = Date.now(); return; }
+  if (msg.t === 'pong') { rec.lastPong = Date.now(); if (state) renderRoster(); return; }
 
   if (msg.t === 'hello') {
     if (rec.role) { sendWelcome(rec, conn); return; }
@@ -585,6 +587,7 @@ function startHeartbeat() {
         try { rec.conn.send({ t: 'ping' }); } catch (e) {}
       }
     });
+    if (state) renderRoster();
   }, 8000);
 }
 function stopHeartbeat() {
@@ -658,9 +661,11 @@ function joinRoom(code) {
   roomCode = code;
   setJoinBusy(true);
   startNetTimer('signaling');
+  setJoinStatus('Connecting to signaling server…');
   peer = new Peer({ config: ICE_CONFIG }); // random ID
   peer.on('open', function () {
     netStage = 'connecting';
+    setJoinStatus('Contacting host…');
     hostConn = peer.connect('gomoku-' + roomCode, { reliable: true });
     wireHostConn();
   });
@@ -684,6 +689,7 @@ function wireHostConn() {
   hostConn.on('open', function () {
     connecting = false;
     netStage = 'waiting-welcome';
+    setJoinStatus('Waiting for host reply…');
     setNetDot(true);
     lastHostPong = Date.now();
     startHostWatchdog();
@@ -712,6 +718,7 @@ function startHostWatchdog() {
       return;
     }
     try { hostConn.send({ t: 'ping' }); } catch (e) {}
+    if (state) renderRoster();
   }, 8000);
 }
 function stopHostWatchdog() {
@@ -720,7 +727,7 @@ function stopHostWatchdog() {
 
 function onHostMessage(msg) {
   if (msg.t === 'ping') { try { hostConn.send({ t: 'pong' }); } catch (e) {} return; }
-  if (msg.t === 'pong') { lastHostPong = Date.now(); return; }
+  if (msg.t === 'pong') { lastHostPong = Date.now(); if (state) renderRoster(); return; }
   if (msg.t === 'welcome') {
     clearNetTimer();
     myRole = msg.role;
@@ -762,6 +769,7 @@ function enterRoom() {
   reqSeen = '';
   setJoinBusy(false);
   setCreateBusy(false);
+  setJoinStatus('');
   probeNetInfo();
   if (mode === 'host') requestWakeLock();
   hideModal();
@@ -778,6 +786,7 @@ function cleanupToHome() {
   releaseWakeLock();
   setJoinBusy(false);
   setCreateBusy(false);
+  setJoinStatus('');
   // Clear state BEFORE closing connections, so the close handlers fired by
   // those closes see a torn-down room and stay quiet (no duplicate toasts,
   // no re-entrant cleanup, no seat shuffling on a room being left).
@@ -1019,17 +1028,38 @@ function renderRoster() {
   box.innerHTML = html;
 }
 
+function linkStatus(side) {
+  var p = state.players[side];
+  if (!p) return null;
+  if (mode === 'host') {
+    if (p.holder === 'host') return 'self';
+    var rec = conns.get(p.holder);
+    if (!rec) return 'gone';
+    return (Date.now() - rec.lastPong < 12000) ? 'online' : 'weak';
+  }
+  if (p.holder === 'host') {
+    if (!lastHostPong) return 'gone';
+    return (Date.now() - lastHostPong < 12000) ? 'online' : 'weak';
+  }
+  if ((side === 'black' && myRole === 'black') || (side === 'white' && myRole === 'white')) return 'self';
+  return null;
+}
+
 function playerCard(side, color) {
   var p = state.players[side];
   var isTurn = state.status === 'playing' && state.turn === color;
   var isMe = (side === 'black' && myRole === 'black') || (side === 'white' && myRole === 'white');
   var wins = p ? (state.score[p.name] || 0) : 0;
+  var ls = linkStatus(side);
+  var linkHtml = ls === 'online' ? '<span class="plink on">● Online</span>' :
+    ls === 'weak' ? '<span class="plink weak">● Connection weak</span>' :
+    ls === 'gone' ? '<span class="plink off">● Offline</span>' : '';
   return '<div class="player-card' + (isTurn ? ' turn' : '') + '">' +
     '<span class="stone-dot ' + (color === BLACK ? 'b' : 'w') + '"></span>' +
     '<span class="pinfo"><span class="pname">' + esc(p ? p.name : 'Waiting…') +
     (isMe ? ' (you)' : '') + '</span>' +
     '<span class="pside">' + (color === BLACK ? 'Black · First move' : 'White') +
-    (p ? ' · ' + wins + (wins === 1 ? ' win' : ' wins') : '') + '</span></span>' +
+    (p ? ' · ' + wins + (wins === 1 ? ' win' : ' wins') : '') + '</span>' + linkHtml + '</span>' +
     (isTurn ? '<span class="turn-dot"></span>' : '') +
     '</div>';
 }
