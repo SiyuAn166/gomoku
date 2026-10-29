@@ -127,6 +127,56 @@ function setJoinBusy(busy) {
   b.textContent = busy ? 'Joining…' : 'Join';
 }
 function setCreateBusy(busy) { $('btn-create').disabled = busy; }
+
+/* Local network info: gather ICE candidates from a throwaway connection and
+ * show the device's LAN address, so two players can check they share a WiFi.
+ * Modern browsers mask the real LAN address as a .local mDNS name; we say so
+ * instead of showing a useless value. */
+function probeNetInfo() {
+  var boxes = [$('net-info'), $('net-info-home')];
+  var setText = function (t) { boxes.forEach(function (b) { if (b) b.textContent = t; }); };
+  try {
+    if (typeof RTCPeerConnection === 'undefined') return;
+    var pc = new RTCPeerConnection({ iceServers: ICE_CONFIG.iceServers });
+    var done = false;
+    var hostIp = '', pubIp = '';
+    var finish = function () {
+      if (done) return; done = true;
+      try { pc.close(); } catch (e) {}
+      setText(netInfoText(hostIp, pubIp));
+    };
+    pc.onicecandidate = function (e) {
+      if (!e.candidate) { finish(); return; }
+      var c = String(e.candidate.candidate || '').split(' ');
+      if (c[7] === 'host' && !hostIp) hostIp = c[4];
+      else if (c[7] === 'srflx' && !pubIp) pubIp = c[4];
+    };
+    pc.createDataChannel('probe');
+    pc.createOffer().then(function (o) { return pc.setLocalDescription(o); }).catch(function () { finish(); });
+    setTimeout(finish, 4000);
+  } catch (e) {}
+}
+function netInfoText(hostIp, pubIp) {
+  if (!hostIp && !pubIp) return '';
+  if (hostIp && hostIp.indexOf('.local') >= 0) return 'LAN: ' + hostIp + ' (browser masks the real IP)';
+  if (hostIp) return 'LAN: ' + hostIp + (pubIp ? ' · Net: ' + pubIp : '');
+  return 'Net: ' + pubIp;
+}
+
+/* Screen wake lock: while hosting, keep the phone screen on so the browser
+ * is not frozen by lock/backgrounding while the friend joins. Released on
+ * leave; re-requested when the tab becomes visible again. */
+var wakeLock = null;
+function requestWakeLock() {
+  try {
+    if (navigator.wakeLock && navigator.wakeLock.request) {
+      navigator.wakeLock.request('screen').then(function (lock) { wakeLock = lock; }).catch(function () {});
+    }
+  } catch (e) {}
+}
+function releaseWakeLock() {
+  try { if (wakeLock) { wakeLock.release(); wakeLock = null; } } catch (e) {}
+}
 function mySide() {
   return myRole === 'black' ? 'black' : myRole === 'white' ? 'white' : 'spectator';
 }
@@ -712,6 +762,8 @@ function enterRoom() {
   reqSeen = '';
   setJoinBusy(false);
   setCreateBusy(false);
+  probeNetInfo();
+  if (mode === 'host') requestWakeLock();
   hideModal();
   $('room-code').textContent = roomCode;
   var badge = $('role-badge');
@@ -723,6 +775,7 @@ function enterRoom() {
 
 function cleanupToHome() {
   clearNetTimer();
+  releaseWakeLock();
   setJoinBusy(false);
   setCreateBusy(false);
   // Clear state BEFORE closing connections, so the close handlers fired by
@@ -1012,4 +1065,8 @@ document.addEventListener('DOMContentLoaded', function () {
   initHome();
   initBoard();
   $('room-code').addEventListener('click', copyRoomCode);
+  probeNetInfo();
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && mode === 'host') requestWakeLock();
+  });
 });

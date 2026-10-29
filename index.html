@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0e1320">
 <title>Gomoku · LAN Play</title>
-<link rel="stylesheet" href="styles.css?v=8">
+<link rel="stylesheet" href="styles.css?v=9">
 </head>
 <body>
 <div id="app">
@@ -40,6 +40,7 @@
       <p>· Undo, draw offers and resign are available mid-game (opponent confirms undo/draw)</p>
       <p>· Both phones need the same WiFi plus internet access (to establish the connection)</p>
     </div>
+    <div id="net-info-home" class="net-info"></div>
   </section>
 
   <!-- Room -->
@@ -48,6 +49,7 @@
       <div class="room-code-wrap">
         <div class="room-code-label">Room code (tap to copy)</div>
         <div id="room-code" class="room-code">----</div>
+        <div id="net-info" class="net-info"></div>
       </div>
       <div id="role-badge" class="role-badge"></div>
       <div id="net-dot" class="net-dot" title="Disconnected"></div>
@@ -79,7 +81,7 @@
 <div id="toast-wrap"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<script src="logic.js?v=8"></script>
-<script src="app.js?v=8"></script>
+<script src="logic.js?v=9"></script>
+<script src="app.js?v=9"></script>
 </body>
 </html>
