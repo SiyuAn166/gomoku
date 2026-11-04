@@ -51,3 +51,4 @@ Both phones open that URL on the same WiFi to start a room and play.
 - **Stuck on "connecting"**: your router may have AP/client isolation enabled (blocking devices from talking to each other), or it may block the multicast lookup browsers use to resolve each other's `.local` names. There is no relay fallback in this version; if it keeps failing, try a phone hotspot.
 - A fully offline variant (no internet at all) would need manual connection-info exchange (e.g. scanning SDP via QR code) — not supported in this version.
 - Best experienced in mobile Chrome / Safari / Edge.
+<!-- v16 deploy touch -->
