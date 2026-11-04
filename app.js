@@ -170,15 +170,33 @@ function netInfoText(hostIp, pubIp) {
  * is not frozen by lock/backgrounding while the friend joins. Released on
  * leave; re-requested when the tab becomes visible again. */
 var wakeLock = null;
+function setWakeStatus(msg) {
+  var s = $('wake-status');
+  if (s) s.textContent = msg || '';
+}
 function requestWakeLock() {
   try {
     if (navigator.wakeLock && navigator.wakeLock.request) {
-      navigator.wakeLock.request('screen').then(function (lock) { wakeLock = lock; }).catch(function () {});
+      navigator.wakeLock.request('screen').then(function (lock) {
+        wakeLock = lock;
+        setWakeStatus('Screen lock on: this phone stays awake while hosting');
+        try {
+          lock.addEventListener('release', function () {
+            if (wakeLock === lock) wakeLock = null;
+            setWakeStatus('Screen lock released: keep this phone awake manually');
+          });
+        } catch (e) {}
+      }).catch(function () {
+        setWakeStatus('Screen lock unavailable: keep this phone awake manually');
+      });
+    } else {
+      setWakeStatus('Screen lock not supported here: keep this phone awake manually');
     }
   } catch (e) {}
 }
 function releaseWakeLock() {
   try { if (wakeLock) { wakeLock.release(); wakeLock = null; } } catch (e) {}
+  setWakeStatus('');
 }
 function mySide() {
   return myRole === 'black' ? 'black' : myRole === 'white' ? 'white' : 'spectator';
@@ -252,11 +270,13 @@ function initHome() {
   $('btn-create').addEventListener('click', function () {
     if (connecting) return;
     myName = clampName($('input-name').value) || ('Player' + Math.floor(Math.random() * 900 + 100));
+    storeName(myName);
     createRoom();
   });
   $('btn-join').addEventListener('click', function () {
     if (connecting) return;
     myName = clampName($('input-name').value) || ('Player' + Math.floor(Math.random() * 900 + 100));
+    storeName(myName);
     var code = $('input-code').value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
     if (code.length !== 4) { toast('Enter the 4-character room code'); return; }
     joinRoom(code);
@@ -316,6 +336,7 @@ function openHostPeer() {
     try { peer.reconnect(); } catch (e) {}
   });
   peer.on('error', function (err) {
+    if (!mode) return; // torn down already (e.g. timeout cleanup); stay quiet
     if (err && err.type === 'unavailable-id') {
       roomCode = makeCode();
       try { peer.destroy(); } catch (e) {}
@@ -623,6 +644,7 @@ function startHeartbeat() {
         try { rec.conn.close(); } catch (e) {}
         onGuestLeft(rec.conn);
       } else {
+        if (!rec.conn.open) return; // not open yet: a ping here would error the conn and drop a still-joining guest
         try { rec.conn.send({ t: 'ping' }); } catch (e) {}
       }
     });
@@ -734,6 +756,7 @@ function startJoin(code) {
     try { peer.reconnect(); } catch (e) {}
   });
   peer.on('error', function (err) {
+    if (!mode) return; // torn down already (e.g. timeout cleanup); stay quiet
     connecting = false;
     setNetDot(false);
     if (err && err.type === 'peer-unavailable') {
@@ -864,6 +887,7 @@ function enterRoom() {
   if (mode === 'host') requestWakeLock();
   hideModal();
   $('room-code').textContent = roomCode;
+  renderJoinQR();
   var badge = $('role-badge');
   badge.textContent = myRole === 'black' ? 'Black · First' : myRole === 'white' ? 'White · Second' : 'Spectating';
   badge.className = 'role-badge ' + myRole;
@@ -1182,6 +1206,32 @@ function renderActions() {
 }
 
 /* ---------------- Boot ---------------- */
+/* Nickname persistence: a returning player keeps their name, so a QR
+ * rejoin after a refresh reclaims the same seat instead of spectating. */
+function loadStoredName() {
+  try { return (window.localStorage && window.localStorage.getItem('gomoku-name')) || ''; } catch (e) { return ''; }
+}
+function storeName(n) {
+  try { if (window.localStorage) window.localStorage.setItem('gomoku-name', n); } catch (e) {}
+}
+
+/* Host QR code: scanning it with the phone's own camera opens this page
+ * with ?code=, so the guest never types a code and a stale code is
+ * impossible — the QR always shows the current room. */
+function renderJoinQR() {
+  var box = $('qr-box');
+  if (!box) return;
+  if (mode !== 'host' || !roomCode) { box.innerHTML = ''; box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  try {
+    if (typeof qrcode === 'undefined') { box.innerHTML = ''; return; }
+    var qr = qrcode(0, 'M');
+    qr.addData('https://siyuan166.github.io/gomoku/?code=' + roomCode);
+    qr.make();
+    box.innerHTML = '<div class="qr-label">Friend scans this with their camera to join</div>' + qr.createSvgTag(4, 6);
+  } catch (e) { box.innerHTML = ''; }
+}
+
 document.addEventListener('DOMContentLoaded', function () {
   initHome();
   initBoard();
@@ -1190,4 +1240,22 @@ document.addEventListener('DOMContentLoaded', function () {
   document.addEventListener('visibilitychange', function () {
     if (!document.hidden && mode === 'host') requestWakeLock();
   });
+  var stored = loadStoredName();
+  if (stored && !$('input-name').value) $('input-name').value = stored;
+  // QR join: a scanned link lands here with ?code=XXXX. Join at once so
+  // there is no code to type and no stale code; then drop the param so
+  // a refresh does not rejoin as a second guest.
+  var scanned = '';
+  try {
+    var qs = (window.location && window.location.search) || '';
+    var m = qs.match(/[?&]code=([A-Za-z0-9]{4})/);
+    if (m) scanned = m[1].toUpperCase();
+  } catch (e) {}
+  if (scanned) {
+    $('input-code').value = scanned;
+    myName = clampName($('input-name').value) || ('Player' + Math.floor(Math.random() * 900 + 100));
+    storeName(myName);
+    try { if (window.history && window.history.replaceState) window.history.replaceState(null, '', window.location.pathname); } catch (e) {}
+    joinRoom(scanned);
+  }
 });
