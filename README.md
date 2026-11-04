@@ -41,13 +41,13 @@ Both phones open that URL on the same WiFi to start a room and play.
 
 - **GitHub Pages only hosts static files**, so there is no game server. Multiplayer runs over **WebRTC peer-to-peer** (PeerJS library).
 - Peers exchange connection info ("signaling") through PeerJS's free public signaling server (`0.peerjs.com`) — it only introduces the two phones.
-- Once connected, moves travel over a WebRTC **DataChannel** directly between the phones — on the same WiFi that's a direct LAN connection with very low latency.
+- Once connected, moves travel over a WebRTC **DataChannel** directly between the phones — on the same WiFi that's a direct LAN connection with very low latency. A public STUN server (Google) only helps the two devices find each other's address when the browser hides local IPs behind `.local` names; it never carries game data.
 - The host (Black) is authoritative: validates moves, detects wins, and broadcasts the full board state to everyone.
 
 ## Notes / FAQ
 
 - **Both phones need internet access** to load the page and establish the connection; after that, game data goes direct over LAN.
 - **"Room not found"**: make sure the host's page is still open (closing it dissolves the room) and the code is typed correctly.
-- **Stuck on "connecting"**: your router may have AP/client isolation enabled (blocking devices from talking to each other). PeerJS ships with a TURN relay fallback that usually gets through; if not, try a different hotspot.
+- **Stuck on "connecting"**: your router may have AP/client isolation enabled (blocking devices from talking to each other), or it may block the multicast lookup browsers use to resolve each other's `.local` names. There is no relay fallback in this version; if it keeps failing, try a phone hotspot.
 - A fully offline variant (no internet at all) would need manual connection-info exchange (e.g. scanning SDP via QR code) — not supported in this version.
 - Best experienced in mobile Chrome / Safari / Edge.

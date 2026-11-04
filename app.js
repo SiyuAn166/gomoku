@@ -44,19 +44,15 @@ var connecting = false;
 var netTimer = null;      // join/create deadline timer (covers every silent stall)
 var netStage = '';        // 'creating' | 'signaling' | 'connecting' | 'waiting-welcome'
 var NET_TIMEOUT_MS = 15000;
-/* ICE servers: Google STUN for direct connections plus a public TURN relay
- * as fallback. Without TURN, two phones behind symmetric NATs (common on
- * cellular networks) cannot establish a WebRTC connection at all — the join
- * just times out at the 'connecting' stage. TURN only relays encrypted
- * WebRTC traffic; it cannot read game data. Adding it is strictly additive:
- * if the relay is unreachable, behavior is unchanged. */
-/* LAN-only: no STUN/TURN at all, only host (same-LAN) candidates.
- * The game is a LAN game (same WiFi); the public relay never worked
- * reliably for phone to phone and only added slow, flaky fallbacks, so
- * it is gone. A link that connects is a direct LAN link. Signaling
- * (room code) still uses the PeerJS cloud, which the page load already
- * needs. Remote play (different networks) is not possible in this mode. */
-var ICE_CONFIG = { iceServers: [] };
+/* ICE: direct LAN first, plus a public STUN server so the pair can also
+ * connect via the router when the browser hides local IPs behind mDNS
+ * (.local) names the other device cannot resolve (blocked multicast or
+ * device isolation on the WiFi). STUN only reveals each device's public
+ * address to the other; game data still flows directly between the two
+ * devices, never through a server. No TURN relay: if neither the direct
+ * LAN path nor the router path works, the join fails and the hotspot
+ * advice applies. Signaling (room code) still uses the PeerJS cloud. */
+var ICE_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 var rejoining = false;
 var rejoinTries = 0;
 var HB_INTERVAL_MS = 8000;
@@ -120,7 +116,7 @@ function onNetTimeout() {
 function connectingTimeoutMsg() {
   var ice = '';
   try { ice = hostConn && hostConn.peerConnection && hostConn.peerConnection.iceConnectionState; } catch (e) {}
-  if (ice === 'failed') return 'Connection failed: the two devices could not link on the local network. Make sure both are on the same WiFi with no device isolation, or try a phone hotspot.';
+  if (ice === 'failed') return 'Connection failed: the two devices could not link directly. Make sure both are on the same WiFi with no device isolation, or try a phone hotspot.';
   return 'Connection timed out. The host may not be responding — keep the host page open in the foreground — or the room code may be wrong.';
 }
 function setJoinBusy(busy) {
@@ -772,15 +768,15 @@ function wireHostConn() {
   var c = hostConn; // identity guard: events from a torn-down attempt
   // (e.g. a late open after fail-fast cleanup) must not touch the room
   // or a newer connection.
-  // LAN fail-fast: if ICE reports 'failed' while still connecting,
-  // no direct LAN path exists — say so at once instead of hanging 15s.
+  // Direct fail-fast: if ICE reports 'failed' while still connecting,
+  // no direct or router-assisted path exists — say so at once instead of hanging 15s.
   // Guarded to the connecting window so a mid-game ICE failure still
   // goes through the watchdog/rejoin path instead of dropping home.
   try {
     var pc = hostConn.peerConnection;
     if (pc) pc.oniceconnectionstatechange = function () {
       if (connecting && mode === 'guest' && pc.iceConnectionState === 'failed') {
-        toast('LAN direct failed: both phones must be on the same WiFi with no device isolation. Try a phone hotspot.', 6000);
+        toast('Connection failed: this network blocks direct links between devices, even on the same WiFi. Try a phone hotspot.', 6000);
         cleanupToHome();
       }
     };
