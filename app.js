@@ -50,28 +50,17 @@ var NET_TIMEOUT_MS = 15000;
  * just times out at the 'connecting' stage. TURN only relays encrypted
  * WebRTC traffic; it cannot read game data. Adding it is strictly additive:
  * if the relay is unreachable, behavior is unchanged. */
-var ICE_CONFIG = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:openrelay.metered.ca:80' },
-    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
-  ]
-};
-/* LAN direct mode: no STUN/TURN at all, only host (same-LAN) candidates.
- * Both phones must be on the same WiFi. Gathering is faster, and a link
- * that does connect is a direct LAN link, never a flaky public relay.
- * Signaling (room code) still uses the PeerJS cloud, which the page load
- * already needs. Failures here are fast and diagnosable instead of a
- * 15s relay timeout. */
-var LAN_CONFIG = { iceServers: [] };
-var lanMode = false;
+/* LAN-only: no STUN/TURN at all, only host (same-LAN) candidates.
+ * The game is a LAN game (same WiFi); the public relay never worked
+ * reliably for phone to phone and only added slow, flaky fallbacks, so
+ * it is gone. A link that connects is a direct LAN link. Signaling
+ * (room code) still uses the PeerJS cloud, which the page load already
+ * needs. Remote play (different networks) is not possible in this mode. */
+var ICE_CONFIG = { iceServers: [] };
 var rejoining = false;
 var rejoinTries = 0;
 var HB_INTERVAL_MS = 8000;
 var HOST_SILENCE_MS = 20000;
-function activeIceConfig() { return lanMode ? LAN_CONFIG : ICE_CONFIG; }
 var hbTimer = null;       // host heartbeat interval
 var hostHbTimer = null;   // guest watchdog interval
 var lastHostPong = 0;
@@ -131,7 +120,7 @@ function onNetTimeout() {
 function connectingTimeoutMsg() {
   var ice = '';
   try { ice = hostConn && hostConn.peerConnection && hostConn.peerConnection.iceConnectionState; } catch (e) {}
-  if (ice === 'failed') return 'Connection failed: the two phones could not link directly or via relay. Try both phones on the same WiFi, with the host page open in the foreground.';
+  if (ice === 'failed') return 'Connection failed: the two devices could not link on the local network. Make sure both are on the same WiFi with no device isolation, or try a phone hotspot.';
   return 'Connection timed out. The host may not be responding — keep the host page open in the foreground — or the room code may be wrong.';
 }
 function setJoinBusy(busy) {
@@ -275,17 +264,6 @@ function initHome() {
   $('input-code').addEventListener('input', function () {
     this.value = this.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
   });
-  var lanBox = $('check-lan');
-  try {
-    if (typeof localStorage !== 'undefined' && localStorage.getItem('gomoku-lan') === '1') {
-      lanBox.checked = true;
-      lanMode = true;
-    }
-  } catch (e) {}
-  lanBox.addEventListener('change', function () {
-    lanMode = !!lanBox.checked;
-    try { if (typeof localStorage !== 'undefined') localStorage.setItem('gomoku-lan', lanMode ? '1' : '0'); } catch (e) {}
-  });
 }
 
 function setNetDot(on) {
@@ -318,7 +296,7 @@ function resetNetState() {
 }
 
 function openHostPeer() {
-  peer = new Peer('gomoku-' + roomCode, { config: activeIceConfig() });
+  peer = new Peer('gomoku-' + roomCode, { config: ICE_CONFIG });
   peer.on('open', function () {
     connecting = false;
     clearNetTimer();
@@ -709,9 +687,9 @@ function joinRoom(code) {
   startJoin(code);
 }
 
-/* Guest auto-rejoin (LAN mode only): after a transient WiFi blip, silently
- * rejoin with the same room code instead of dropping the player home.
- * Bounded to 2 attempts; a genuinely dead host still ends up home. */
+/* Guest auto-rejoin: after a transient WiFi blip, silently rejoin with
+ * the same room code instead of dropping the player home. Bounded to 2
+ * attempts; a genuinely dead host still ends up home. */
 function tryRejoin() {
   rejoining = true;
   try { if (hostConn) hostConn.close(); } catch (e) {}
@@ -732,7 +710,7 @@ function startJoin(code) {
   setJoinBusy(true);
   startNetTimer('signaling');
   setJoinStatus('Connecting to signaling server…');
-  peer = new Peer({ config: activeIceConfig() }); // random ID
+  peer = new Peer({ config: ICE_CONFIG }); // random ID
   peer.on('open', function () {
     netStage = 'connecting';
     setJoinStatus('Contacting host…');
@@ -756,15 +734,14 @@ function startJoin(code) {
 }
 
 function wireHostConn() {
-  // LAN mode fail-fast: if ICE reports 'failed' while still connecting,
-  // no direct LAN path exists — say so at once instead of hanging 15s
-  // on relay fallbacks that LAN mode deliberately skips. Guarded to the
-  // connecting window so a mid-game ICE failure still goes through the
-  // watchdog/rejoin path instead of dropping the player home.
+  // LAN fail-fast: if ICE reports 'failed' while still connecting,
+  // no direct LAN path exists — say so at once instead of hanging 15s.
+  // Guarded to the connecting window so a mid-game ICE failure still
+  // goes through the watchdog/rejoin path instead of dropping home.
   try {
     var pc = hostConn.peerConnection;
     if (pc) pc.oniceconnectionstatechange = function () {
-      if (lanMode && connecting && mode === 'guest' && pc.iceConnectionState === 'failed') {
+      if (connecting && mode === 'guest' && pc.iceConnectionState === 'failed') {
         toast('LAN direct failed: both phones must be on the same WiFi with no device isolation. Try a phone hotspot.', 6000);
         cleanupToHome();
       }
@@ -791,15 +768,14 @@ function wireHostConn() {
   hostConn.on('error', function () {});
 }
 
-/* Guest watchdog: if the host goes silent, LAN mode retries the join
- * before giving up; other modes leave the room as before. */
+/* Guest watchdog: if the host goes silent, retry the join before giving up. */
 function startHostWatchdog() {
   stopHostWatchdog();
   hostHbTimer = setInterval(function () {
     if (mode !== 'guest' || !hostConn) return;
     if (Date.now() - lastHostPong > HOST_SILENCE_MS) {
       stopHostWatchdog();
-      if (lanMode && rejoinTries < 2 && roomCode) {
+      if (rejoinTries < 2 && roomCode) {
         rejoinTries++;
         tryRejoin();
         return;

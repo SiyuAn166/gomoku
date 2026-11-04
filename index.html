@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0e1320">
 <title>Gomoku · LAN Play</title>
-<link rel="stylesheet" href="styles.css?v=11">
+<link rel="stylesheet" href="styles.css?v=12">
 </head>
 <body>
 <div id="app">
@@ -33,14 +33,13 @@
       <button id="btn-join" class="btn btn-primary">Join</button>
     </div>
     <div id="join-status" class="net-info"></div>
-    <label class="lan-row"><input type="checkbox" id="check-lan"> LAN direct mode: same WiFi only, no relay. Faster and steadier locally; fails fast if the phones cannot link directly.</label>
 
     <div class="hint-box">
       <p>· The room creator plays Black in game 1; the first to join plays White</p>
       <p>· Colors swap after every game — nobody stays Black forever</p>
       <p>· Everyone joining after that becomes a spectator with a live board</p>
       <p>· Undo, draw offers and resign are available mid-game (opponent confirms undo/draw)</p>
-      <p>· Both phones need the same WiFi plus internet access (to establish the connection)</p>
+      <p>· Both devices must be on the same WiFi; internet is only used to load the page and share the room code</p>
     </div>
     <div id="net-info-home" class="net-info"></div>
   </section>
@@ -83,7 +82,7 @@
 <div id="toast-wrap"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<script src="logic.js?v=11"></script>
-<script src="app.js?v=11"></script>
+<script src="logic.js?v=12"></script>
+<script src="app.js?v=12"></script>
 </body>
 </html>
