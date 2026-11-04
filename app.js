@@ -349,6 +349,13 @@ function onGuestConnected(conn) {
   conn.on('data', function (msg) { handleGuestMessage(conn, msg || {}); });
   conn.on('close', function () { onGuestLeft(conn); });
   conn.on('error', function () { onGuestLeft(conn); });
+  // Host-side diagnostic: show the connection attempt at once, so the
+  // host can tell a guest is trying even if hello/ICE never completes.
+  // Cleared when the guest seats (hello) or the attempt dies (leave).
+  if (state) {
+    state.notice = 'A player is connecting…';
+    broadcastState();
+  }
 }
 
 /* Reply with the welcome packet (and the following broadcast) as soon as the
@@ -410,6 +417,7 @@ function handleGuestMessage(conn, msg) {
       rec.name = rawName;
       rec.role = reclaimSeat;
       state.players[reclaimSeat] = { name: rawName, holder: id };
+      state.notice = '';
       sendWelcome(rec, conn);
       return;
     }
@@ -429,6 +437,7 @@ function handleGuestMessage(conn, msg) {
       state.spectators.push({ id: id, name: name });
       toast(name + ' joined as spectator');
     }
+    state.notice = '';
     sendWelcome(rec, conn);
     return;
   }
@@ -557,6 +566,9 @@ function onGuestLeft(conn) {
   conns.delete(id);
   if (peerToConn[conn.peer] === id) delete peerToConn[conn.peer];
   if (rec.replaced) return; // superseded by a newer connection; the seat stays
+  // An attempt that died before hello leaves no seat behind; just clear
+  // the connecting notice it raised.
+  if (!rec.role && state && state.notice === 'A player is connecting…') state.notice = '';
   var seat = (rec.role === 'black' || rec.role === 'white') ? rec.role : null;
   if (seat && state.players[seat] && state.players[seat].holder === id) {
     var name = state.players[seat].name;
@@ -734,6 +746,9 @@ function startJoin(code) {
 }
 
 function wireHostConn() {
+  var c = hostConn; // identity guard: events from a torn-down attempt
+  // (e.g. a late open after fail-fast cleanup) must not touch the room
+  // or a newer connection.
   // LAN fail-fast: if ICE reports 'failed' while still connecting,
   // no direct LAN path exists — say so at once instead of hanging 15s.
   // Guarded to the connecting window so a mid-game ICE failure still
@@ -748,6 +763,7 @@ function wireHostConn() {
     };
   } catch (e) {}
   hostConn.on('open', function () {
+    if (hostConn !== c) return;
     connecting = false;
     netStage = 'waiting-welcome';
     setJoinStatus('Waiting for host reply…');
@@ -756,8 +772,9 @@ function wireHostConn() {
     startHostWatchdog();
     hostConn.send({ t: 'hello', name: myName });
   });
-  hostConn.on('data', function (msg) { onHostMessage(msg || {}); });
+  hostConn.on('data', function (msg) { if (hostConn !== c) return; onHostMessage(msg || {}); });
   hostConn.on('close', function () {
+    if (hostConn !== c) return;
     stopHostWatchdog();
     if (rejoining) return; // old link torn down for a rejoin; stay quiet
     if (mode === 'guest') {
