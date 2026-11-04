@@ -59,6 +59,19 @@ var ICE_CONFIG = {
     { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
   ]
 };
+/* LAN direct mode: no STUN/TURN at all, only host (same-LAN) candidates.
+ * Both phones must be on the same WiFi. Gathering is faster, and a link
+ * that does connect is a direct LAN link, never a flaky public relay.
+ * Signaling (room code) still uses the PeerJS cloud, which the page load
+ * already needs. Failures here are fast and diagnosable instead of a
+ * 15s relay timeout. */
+var LAN_CONFIG = { iceServers: [] };
+var lanMode = false;
+var rejoining = false;
+var rejoinTries = 0;
+var HB_INTERVAL_MS = 8000;
+var HOST_SILENCE_MS = 20000;
+function activeIceConfig() { return lanMode ? LAN_CONFIG : ICE_CONFIG; }
 var hbTimer = null;       // host heartbeat interval
 var hostHbTimer = null;   // guest watchdog interval
 var lastHostPong = 0;
@@ -262,6 +275,17 @@ function initHome() {
   $('input-code').addEventListener('input', function () {
     this.value = this.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
   });
+  var lanBox = $('check-lan');
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage.getItem('gomoku-lan') === '1') {
+      lanBox.checked = true;
+      lanMode = true;
+    }
+  } catch (e) {}
+  lanBox.addEventListener('change', function () {
+    lanMode = !!lanBox.checked;
+    try { if (typeof localStorage !== 'undefined') localStorage.setItem('gomoku-lan', lanMode ? '1' : '0'); } catch (e) {}
+  });
 }
 
 function setNetDot(on) {
@@ -294,7 +318,7 @@ function resetNetState() {
 }
 
 function openHostPeer() {
-  peer = new Peer('gomoku-' + roomCode, { config: ICE_CONFIG });
+  peer = new Peer('gomoku-' + roomCode, { config: activeIceConfig() });
   peer.on('open', function () {
     connecting = false;
     clearNetTimer();
@@ -386,7 +410,32 @@ function handleGuestMessage(conn, msg) {
 
   if (msg.t === 'hello') {
     if (rec.role) { sendWelcome(rec, conn); return; }
-    var name = uniqueName(clampName(msg.name) || 'Player', id);
+    var rawName = clampName(msg.name) || 'Player';
+    // Rejoin reclaim: if a seat holds this name on a dead link (closed
+    // connection or stale heartbeat), hand the seat to the new connection
+    // instead of seating them as a spectator with a renamed duplicate.
+    // A live player with fresh heartbeats is never reclaimed.
+    var reclaimSeat = null;
+    ['black', 'white'].forEach(function (s) {
+      var p = state.players[s];
+      if (!p || p.holder === 'host' || p.name !== rawName) return;
+      var oldRec = conns.get(p.holder);
+      if (!oldRec || !oldRec.conn.open || Date.now() - oldRec.lastPong > HOST_SILENCE_MS) reclaimSeat = s;
+    });
+    if (reclaimSeat) {
+      var oldRec2 = conns.get(state.players[reclaimSeat].holder);
+      if (oldRec2) {
+        oldRec2.replaced = true;
+        conns.delete(state.players[reclaimSeat].holder);
+        try { oldRec2.conn.close(); } catch (e) {}
+      }
+      rec.name = rawName;
+      rec.role = reclaimSeat;
+      state.players[reclaimSeat] = { name: rawName, holder: id };
+      sendWelcome(rec, conn);
+      return;
+    }
+    var name = uniqueName(rawName, id);
     rec.name = name;
     var seat = freeSeat();
     if (seat) {
@@ -580,7 +629,7 @@ function startHeartbeat() {
     var now = Date.now();
     conns.forEach(function (rec, id) {
       if (rec.replaced) { conns.delete(id); return; }
-      if (now - rec.lastPong > 20000) {
+      if (now - rec.lastPong > HOST_SILENCE_MS) {
         try { rec.conn.close(); } catch (e) {}
         onGuestLeft(rec.conn);
       } else {
@@ -588,7 +637,7 @@ function startHeartbeat() {
       }
     });
     if (state) renderRoster();
-  }, 8000);
+  }, HB_INTERVAL_MS);
 }
 function stopHeartbeat() {
   if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
@@ -655,6 +704,27 @@ function onResign() {
 /* ---------------- Guest (seated player / spectator) ---------------- */
 function joinRoom(code) {
   if (typeof Peer === 'undefined') { toast('Failed to load network module. Check your connection and refresh.'); return; }
+  rejoinTries = 0;
+  rejoining = false;
+  startJoin(code);
+}
+
+/* Guest auto-rejoin (LAN mode only): after a transient WiFi blip, silently
+ * rejoin with the same room code instead of dropping the player home.
+ * Bounded to 2 attempts; a genuinely dead host still ends up home. */
+function tryRejoin() {
+  rejoining = true;
+  try { if (hostConn) hostConn.close(); } catch (e) {}
+  hostConn = null;
+  try { if (peer) peer.destroy(); } catch (e) {}
+  peer = null;
+  stopHostWatchdog();
+  setNetDot(false);
+  toast('Connection lost, reconnecting… (attempt ' + rejoinTries + ' of 2)');
+  startJoin(roomCode);
+}
+
+function startJoin(code) {
   resetNetState();
   connecting = true;
   mode = 'guest';
@@ -662,7 +732,7 @@ function joinRoom(code) {
   setJoinBusy(true);
   startNetTimer('signaling');
   setJoinStatus('Connecting to signaling server…');
-  peer = new Peer({ config: ICE_CONFIG }); // random ID
+  peer = new Peer({ config: activeIceConfig() }); // random ID
   peer.on('open', function () {
     netStage = 'connecting';
     setJoinStatus('Contacting host…');
@@ -686,6 +756,20 @@ function joinRoom(code) {
 }
 
 function wireHostConn() {
+  // LAN mode fail-fast: if ICE reports 'failed' while still connecting,
+  // no direct LAN path exists — say so at once instead of hanging 15s
+  // on relay fallbacks that LAN mode deliberately skips. Guarded to the
+  // connecting window so a mid-game ICE failure still goes through the
+  // watchdog/rejoin path instead of dropping the player home.
+  try {
+    var pc = hostConn.peerConnection;
+    if (pc) pc.oniceconnectionstatechange = function () {
+      if (lanMode && connecting && mode === 'guest' && pc.iceConnectionState === 'failed') {
+        toast('LAN direct failed: both phones must be on the same WiFi with no device isolation. Try a phone hotspot.', 6000);
+        cleanupToHome();
+      }
+    };
+  } catch (e) {}
   hostConn.on('open', function () {
     connecting = false;
     netStage = 'waiting-welcome';
@@ -698,6 +782,7 @@ function wireHostConn() {
   hostConn.on('data', function (msg) { onHostMessage(msg || {}); });
   hostConn.on('close', function () {
     stopHostWatchdog();
+    if (rejoining) return; // old link torn down for a rejoin; stay quiet
     if (mode === 'guest') {
       toast('The host left the room');
       cleanupToHome();
@@ -706,20 +791,26 @@ function wireHostConn() {
   hostConn.on('error', function () {});
 }
 
-/* Guest watchdog: if the host goes silent for >20s, leave the room. */
+/* Guest watchdog: if the host goes silent, LAN mode retries the join
+ * before giving up; other modes leave the room as before. */
 function startHostWatchdog() {
   stopHostWatchdog();
   hostHbTimer = setInterval(function () {
     if (mode !== 'guest' || !hostConn) return;
-    if (Date.now() - lastHostPong > 20000) {
+    if (Date.now() - lastHostPong > HOST_SILENCE_MS) {
       stopHostWatchdog();
+      if (lanMode && rejoinTries < 2 && roomCode) {
+        rejoinTries++;
+        tryRejoin();
+        return;
+      }
       toast('Lost connection to host');
       cleanupToHome();
       return;
     }
     try { hostConn.send({ t: 'ping' }); } catch (e) {}
     if (state) renderRoster();
-  }, 8000);
+  }, HB_INTERVAL_MS);
 }
 function stopHostWatchdog() {
   if (hostHbTimer) { clearInterval(hostHbTimer); hostHbTimer = null; }
@@ -734,11 +825,17 @@ function onHostMessage(msg) {
     myColor = msg.role === 'black' ? BLACK : msg.role === 'white' ? WHITE : 0;
     state = msg.state;
     enterRoom();
-    toast(
-      msg.role === 'black' ? 'You are now Black (first move)' :
-      msg.role === 'white' ? 'Seated! You are White (second move)' :
-      'You are now spectating'
-    );
+    if (rejoining) {
+      rejoining = false;
+      rejoinTries = 0;
+      toast('Reconnected!');
+    } else {
+      toast(
+        msg.role === 'black' ? 'You are now Black (first move)' :
+        msg.role === 'white' ? 'Seated! You are White (second move)' :
+        'You are now spectating'
+      );
+    }
     return;
   }
   if (msg.t === 'state') {
@@ -796,6 +893,7 @@ function cleanupToHome() {
   conns.clear();
   peerToConn = {};
   mode = null; myRole = null; myColor = 0; roomCode = '';
+  rejoining = false; rejoinTries = 0;
   state = null; connecting = false; reqSeen = '';
   try { if (hc) hc.close(); } catch (e) {}
   all.forEach(function (c) { try { c.close(); } catch (e) {} });
