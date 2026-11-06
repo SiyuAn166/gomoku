@@ -44,15 +44,53 @@ var connecting = false;
 var netTimer = null;      // join/create deadline timer (covers every silent stall)
 var netStage = '';        // 'creating' | 'signaling' | 'connecting' | 'waiting-welcome'
 var NET_TIMEOUT_MS = 15000;
-/* ICE: direct LAN first, plus a public STUN server so the pair can also
- * connect via the router when the browser hides local IPs behind mDNS
- * (.local) names the other device cannot resolve (blocked multicast or
- * device isolation on the WiFi). STUN only reveals each device's public
- * address to the other; game data still flows directly between the two
- * devices, never through a server. No TURN relay: if neither the direct
- * LAN path nor the router path works, the join fails and the hotspot
- * advice applies. Signaling (room code) still uses the PeerJS cloud. */
+/* ICE: direct LAN first (host candidates), plus a public STUN server so the
+ * pair can also connect via the router when the browser hides local IPs
+ * behind mDNS (.local) names the other device cannot resolve, plus a TURN
+ * relay fallback for networks where neither direct nor router-assisted
+ * links work (device isolation, blocked multicast, no hairpin). The relay
+ * is Open Relay (Metered) via its published static-auth scheme: the
+ * browser computes a time-limited credential from the public secret, so
+ * no account or API key is needed. Relayed traffic is DTLS-encrypted
+ * end to end; the relay only forwards packets and cannot read game data.
+ * STUN only reveals each device's public address to the other. Signaling
+ * (room code) still uses the PeerJS cloud. */
 var ICE_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+var TURN_HOST = 'staticauth.openrelay.metered.ca';
+var TURN_SECRET = 'openrelayprojectsecret';
+var TURN_TTL_S = 86400;
+var iceConfigCache = null; // { config, until }
+function computeTurnCredential() {
+  try {
+    if (typeof crypto === 'undefined' || !crypto.subtle || typeof TextEncoder === 'undefined' || typeof btoa === 'undefined') return Promise.resolve(null);
+    var expiry = Math.floor(Date.now() / 1000) + TURN_TTL_S;
+    var username = expiry + ':gomoku';
+    var enc = new TextEncoder();
+    return crypto.subtle.importKey('raw', enc.encode(TURN_SECRET), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign'])
+      .then(function (key) { return crypto.subtle.sign('HMAC', key, enc.encode(username)); })
+      .then(function (sig) {
+        var bytes = new Uint8Array(sig);
+        var bin = '';
+        for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        return { username: username, credential: btoa(bin) };
+      })
+      .catch(function () { return null; });
+  } catch (e) { return Promise.resolve(null); }
+}
+function getIceConfig() {
+  var now = Date.now();
+  if (iceConfigCache && iceConfigCache.until > now) return Promise.resolve(iceConfigCache.config);
+  var fallback = { iceServers: ICE_CONFIG.iceServers.slice() };
+  var timeout = new Promise(function (resolve) { setTimeout(function () { resolve(null); }, 2000); });
+  return Promise.race([computeTurnCredential(), timeout]).then(function (turn) {
+    var config = fallback;
+    if (turn) {
+      config = { iceServers: ICE_CONFIG.iceServers.slice().concat([{ urls: ['turn:' + TURN_HOST + ':80', 'turn:' + TURN_HOST + ':443', 'turn:' + TURN_HOST + ':443?transport=tcp'], username: turn.username, credential: turn.credential }]) };
+      iceConfigCache = { config: config, until: now + (TURN_TTL_S - 60) * 1000 };
+    }
+    return config;
+  });
+}
 var rejoining = false;
 var rejoinTries = 0;
 var HB_INTERVAL_MS = 8000;
@@ -116,7 +154,7 @@ function onNetTimeout() {
 function connectingTimeoutMsg() {
   var ice = '';
   try { ice = hostConn && hostConn.peerConnection && hostConn.peerConnection.iceConnectionState; } catch (e) {}
-  if (ice === 'failed') return 'Connection failed: the two devices could not link directly. Make sure both are on the same WiFi with no device isolation, or try a phone hotspot.';
+  if (ice === 'failed') return 'Connection failed: the two devices could not link, even through the relay. Check your internet connection, or try a phone hotspot.';
   return 'Connection timed out. The host may not be responding — keep the host page open in the foreground — or the room code may be wrong.';
 }
 function setJoinBusy(busy) {
@@ -312,7 +350,9 @@ function resetNetState() {
 }
 
 function openHostPeer() {
-  peer = new Peer('gomoku-' + roomCode, { config: ICE_CONFIG });
+  getIceConfig().then(function (cfg) {
+  if (!mode) return; // torn down while credentials were computed
+  peer = new Peer('gomoku-' + roomCode, { config: cfg });
   peer.on('open', function () {
     connecting = false;
     clearNetTimer();
@@ -342,6 +382,7 @@ function openHostPeer() {
     connecting = false;
     setNetDot(false);
     toast('Failed to create room: ' + errTypeText(err));
+  });
   });
 }
 
@@ -740,7 +781,9 @@ function startJoin(code) {
   setJoinBusy(true);
   startNetTimer('signaling');
   setJoinStatus('Connecting to signaling server…');
-  peer = new Peer({ config: ICE_CONFIG }); // random ID
+  getIceConfig().then(function (cfg) {
+  if (!mode) return; // torn down while credentials were computed
+  peer = new Peer({ config: cfg }); // random ID
   peer.on('open', function () {
     netStage = 'connecting';
     setJoinStatus('Contacting host…');
@@ -762,6 +805,7 @@ function startJoin(code) {
     }
     cleanupToHome();
   });
+  });
 }
 
 function wireHostConn() {
@@ -769,14 +813,14 @@ function wireHostConn() {
   // (e.g. a late open after fail-fast cleanup) must not touch the room
   // or a newer connection.
   // Direct fail-fast: if ICE reports 'failed' while still connecting,
-  // no direct or router-assisted path exists — say so at once instead of hanging 15s.
+  // no direct, router-assisted, or relay path exists — say so at once instead of hanging 15s.
   // Guarded to the connecting window so a mid-game ICE failure still
   // goes through the watchdog/rejoin path instead of dropping home.
   try {
     var pc = hostConn.peerConnection;
     if (pc) pc.oniceconnectionstatechange = function () {
       if (connecting && mode === 'guest' && pc.iceConnectionState === 'failed') {
-        toast('Connection failed: this network blocks direct links between devices, even on the same WiFi. Try a phone hotspot.', 6000);
+        toast('Connection failed: the devices could not link, even through the relay. Check your internet connection, or try a phone hotspot.', 6000);
         cleanupToHome();
       }
     };
